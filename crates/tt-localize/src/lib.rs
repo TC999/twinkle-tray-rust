@@ -71,6 +71,94 @@ pub fn detect_language_code(locale: &str) -> String {
     }
 }
 
+
+// ---- 全局当前语言（equiv Translate.js 的 localization.desired）----
+
+use std::sync::Mutex;
+
+static CURRENT: Mutex<Option<(String, Messages<'static>)>> = Mutex::new(None);
+
+/// 语言代码 -> FTL 语料（38 种语言，与 src/localization/*.ftl 一一对应）。
+pub fn language_source(code: &str) -> Option<&'static str> {
+    let src = match code {
+        "ar" => include_str!("../../../src/localization/ar.ftl"),
+        "az" => include_str!("../../../src/localization/az.ftl"),
+        "bn" => include_str!("../../../src/localization/bn.ftl"),
+        "ckb" => include_str!("../../../src/localization/ckb.ftl"),
+        "cs" => include_str!("../../../src/localization/cs.ftl"),
+        "de" => include_str!("../../../src/localization/de.ftl"),
+        "el" => include_str!("../../../src/localization/el.ftl"),
+        "en" => include_str!("../../../src/localization/en.ftl"),
+        "en-GB" => include_str!("../../../src/localization/en-GB.ftl"),
+        "es" => include_str!("../../../src/localization/es.ftl"),
+        "fa" => include_str!("../../../src/localization/fa.ftl"),
+        "fi" => include_str!("../../../src/localization/fi.ftl"),
+        "fr" => include_str!("../../../src/localization/fr.ftl"),
+        "he" => include_str!("../../../src/localization/he.ftl"),
+        "hi" => include_str!("../../../src/localization/hi.ftl"),
+        "hr" => include_str!("../../../src/localization/hr.ftl"),
+        "hu" => include_str!("../../../src/localization/hu.ftl"),
+        "id" => include_str!("../../../src/localization/id.ftl"),
+        "it" => include_str!("../../../src/localization/it.ftl"),
+        "ja" => include_str!("../../../src/localization/ja.ftl"),
+        "ko" => include_str!("../../../src/localization/ko.ftl"),
+        "lt" => include_str!("../../../src/localization/lt.ftl"),
+        "nb" => include_str!("../../../src/localization/nb.ftl"),
+        "nl" => include_str!("../../../src/localization/nl.ftl"),
+        "pl" => include_str!("../../../src/localization/pl.ftl"),
+        "pt" => include_str!("../../../src/localization/pt.ftl"),
+        "pt-BR" => include_str!("../../../src/localization/pt-BR.ftl"),
+        "ro" => include_str!("../../../src/localization/ro.ftl"),
+        "ru" => include_str!("../../../src/localization/ru.ftl"),
+        "sk" => include_str!("../../../src/localization/sk.ftl"),
+        "sv" => include_str!("../../../src/localization/sv.ftl"),
+        "ta" => include_str!("../../../src/localization/ta.ftl"),
+        "th" => include_str!("../../../src/localization/th.ftl"),
+        "tr" => include_str!("../../../src/localization/tr.ftl"),
+        "uk" => include_str!("../../../src/localization/uk.ftl"),
+        "vi" => include_str!("../../../src/localization/vi.ftl"),
+        "zh-Hans" => include_str!("../../../src/localization/zh-Hans.ftl"),
+        "zh-Hant" => include_str!("../../../src/localization/zh-Hant.ftl"),
+        _ => return None,
+    };
+    Some(src)
+}
+
+/// 设置当前语言（equiv getLocalization 的 desired 装载）。
+pub fn set_language(code: &str) {
+    let parsed = language_source(code).map(parse_ftl);
+    if let Ok(mut guard) = CURRENT.lock() {
+        *guard = parsed.map(|m| (code.to_string(), m));
+    }
+}
+
+/// 当前语言代码（未设置时为 en）。
+pub fn current_language() -> String {
+    CURRENT
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(c, _)| c.clone()))
+        .unwrap_or_else(|| "en".to_string())
+}
+
+/// t(key)：用当前语言表 + en 回退链（equiv Translate.getString）。
+pub fn t(key: &str) -> String {
+    let guard = CURRENT.lock().ok();
+    match guard.as_ref().and_then(|g| g.as_ref()) {
+        Some((_, messages)) => get_string_with(messages, key, &[]),
+        None => get_string_with(&Messages::new(), key, &[]),
+    }
+}
+
+/// t_args(key, args)：带占位符替换。
+pub fn t_args(key: &str, args: &[&str]) -> String {
+    let guard = CURRENT.lock().ok();
+    match guard.as_ref().and_then(|g| g.as_ref()) {
+        Some((_, messages)) => get_string_with(messages, key, args),
+        None => get_string_with(&Messages::new(), key, args),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
