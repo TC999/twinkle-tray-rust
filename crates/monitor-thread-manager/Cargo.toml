@@ -1,0 +1,10 @@
+[package]
+name = "monitor-thread-manager"
+version = "0.1.0"
+edition = "2021"
+
+# 等价 electron.js:L158-L545 的主进程侧 worker 管理：
+# 命令队列节流 + 崩溃隔离 + 自动重启 + 30s 失败复位 + 哨兵状态读取。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
