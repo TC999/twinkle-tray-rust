@@ -1,0 +1,41 @@
+// 设计令牌（equiv: origin/src/css/vars.scss + page.scss 的主题变量）。
+// 亮/暗 × Win10/Win11 两轴，与源 CSS 的 body[data-theme] / [data-is-win11] 分支一一对应。
+export global Theme {
+    in-out property <bool> dark: false;
+    in-out property <bool> win11: true;
+    // --system-accent-color / medium / dark（electron.js 从注册表读 AccentColor，缺省 hsl(200,80%,83%)）
+    in-out property <color> accent: #9fd8f2;
+    in-out property <color> accent-medium: #1690d0;
+    in-out property <color> accent-dark: #0a2b3d;
+
+    // --tray-background / --page-background / --tray-text / --tray-border
+    out property <color> tray-bg: dark
+        ? (win11 ? #242424 : #1f1f1f)
+        : (win11 ? #f2f2f2 : #e4e4e4);
+    out property <color> page-bg: dark
+        ? (win11 ? #202020 : #030303)
+        : (win11 ? #f1f3f9 : #ffffff);
+    out property <color> page-section-bg: dark ? #ffffff0a : #ffffff98;
+    out property <color> text: dark ? #ffffff : #000000;
+    out property <color> text-mid: dark ? #bbbbbb : #333333;
+    out property <color> border: dark ? #434343 : #aaaaaa;
+    out property <color> window-border: dark ? #222222 : #dddddd;
+    out property <color> titlebar-icon: dark ? #888888 : #888888;
+    out property <color> titlebar-icon-hover: dark ? #ffffff : #000000;
+    out property <color> input-border: dark ? #6f6f6f : #555555;
+    out property <color> input-active-bg: dark ? #444444 : #dddddd;
+    out property <color> button-bg: dark
+        ? (win11 ? #8a8a8a2b : #454545)
+        : (win11 ? #ffffffc4 : #c0c0c0);
+    out property <color> button-border: dark ? #9797972b : #5c5c5c2b;
+    // --slider-track-color / -focus
+    out property <color> slider-track: dark ? #ffffff6b : #0000006b;
+    out property <color> slider-track-focus: dark ? #ffffffa6 : #000000a6;
+    out property <color> slider-thumb-border: dark ? #414141 : #ffffff;
+    out property <color> sidebar-item-hover: dark ? #ffffff26 : #16161626;
+
+    // 字体（equiv: page.scss 的 'Segoe UI Variable Text', 'Segoe UI'）
+    out property <length> font-base: 13px;
+    out property <length> font-title: 14.5px;
+    out property <length> font-section: 13px;
+}

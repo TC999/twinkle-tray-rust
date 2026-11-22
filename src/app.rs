@@ -78,6 +78,12 @@ pub struct LaunchOptions {
     pub is_monitor_worker: bool,
     /// --app-smoke（自检：启动主进程序列后立即退出）
     pub app_smoke: bool,
+    /// --ui-smoke（自检：创建 Slint 四窗口 + 注入模型后退出）
+    pub ui_smoke: bool,
+    /// --ui-demo（真机渲染：显示面板 + 设置窗口供截图对拍）
+    pub ui_demo: bool,
+    /// --brightness-smoke=<level>（亮度闭环对拍）
+    pub brightness_smoke: Option<f64>,
 }
 
 impl LaunchOptions {
@@ -94,6 +100,12 @@ impl LaunchOptions {
             is_appx: args.iter().any(|a| a == "--appx"),
             is_monitor_worker: args.iter().any(|a| a == "--monitor-worker"),
             app_smoke: args.iter().any(|a| a == "--app-smoke"),
+            ui_smoke: args.iter().any(|a| a == "--ui-smoke"),
+            ui_demo: args.iter().any(|a| a == "--ui-demo"),
+            brightness_smoke: args
+                .iter()
+                .find_map(|a| a.strip_prefix("--brightness-smoke="))
+                .and_then(|v| v.parse::<f64>().ok()),
         }
     }
 }
@@ -210,6 +222,7 @@ mod tests {
         assert!(opts.has_console);
         assert!(opts.app_smoke);
         assert!(!opts.is_monitor_worker);
+        assert!(!opts.ui_smoke);
     }
 
     #[test]

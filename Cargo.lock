@@ -4619,8 +4619,11 @@ dependencies = [
  "serde_json",
  "slint",
  "slint-build",
+ "tray",
  "tt-localize",
+ "twutils",
  "vcp-codes",
+ "windows",
  "wmibridge",
 ]
 

@@ -1,64 +1,686 @@
-// 亮度面板主窗口。
-// 等价 origin/src/panel.js + components/*.jsx 的功能项（重写而非照抄布局，AGENTS.md §4）。
-// 功能项对应:
-//   - 显示器亮度滑块列表（monitors-updated 驱动）
-//   - 亮度联动（linked features: contrast 等跟随亮度）
-//   - 显示器开/关、睡眠按钮
-//   - 设置入口按钮
-import { StandardListView } from "std-widgets.slint";
+// 亮度面板主窗口（equiv: origin/src/components/BrightnessPanel.jsx + css/panel.scss）。
+//
+// 交互语义一一对应：
+//   - 显示器列表（受 hideDisplays / isAdjustableDisplay / hdr 影响）
+//   - 联动滑块（linkedLevelsActive）
+//   - 扩展布局（DDC/CI 特征行：对比度 / 音量 / 输入源 / 自定义 VCP / SDR）
+//   - 电源按钮（features["0xD6"]）、睡眠、设置入口
+//   - 更新提示条 + 下载进度条
+import { Theme } from "theme.slint";
+import { LineEdit } from "std-widgets.slint";
 
-export component PanelWindow inherits Window {
-    in-out property <string> theme: "dark";
-    in-out property <length> panel-width: 320px;
-    in-out property <length> panel-height: 200px;
-    // 显示器列表（JSON 数组序列化传递，字段与 Monitors worker 输出一致）
-    in-out property <string> monitors-json: "[]";
-    // 亮度变更回调（等价 ipc "update-brightness"）
-    callback brightness-changed(string /* monitor id */, int /* percent */);
-    callback refresh-requested();        // 等价 "full-refresh"
-    callback open-settings();            // 等价 "open-settings"
-    callback sleep-displays();           // 等价 "sleep-displays"
-    callback monitor-toggled(string /* id */, bool /* on */); // 等价 "sleep-display"
+export enum DisplayType {
+    wmi,
+    ddcci,
+    studio,
+    software,
+    none,
+}
 
-    title: "Twinkle Tray";
-    width: panel-width;
-    height: panel-height;
+export enum FeatureKind {
+    contrast,
+    volume,
+    inputs,
+    custom,
+    sdr,
+}
 
-    VerticalLayout {
-        padding: 8px;
-        spacing: 4px;
+// 输入源按钮（equiv DDCCISliders.jsx inputsData 表，由 Rust 侧按同一张表注入）
+export struct PanelInput {
+    value: int,
+    label: string,
+}
 
-        // 显示器滑块区（数量由 monitors-json 决定，逐台一行）
-        Rectangle {
-            // Slint 1.x 无动态子组件生成；滑块行由 Rust 侧按显示器数量重建
-            // （等价 React 组件列表渲染语义）
-            height: panel-height - 48px;
-            Text {
-                text: "Monitors";
-                color: theme == "dark" ? #ffffff : #000000;
+// 单条 DDC/CI 特征行（equiv DDCCISliders.jsx / HDRSliders.jsx）
+export struct PanelFeature {
+    code: int,
+    kind: FeatureKind,
+    level: float,
+    // features[vcp][1]：VCP 最大值，用于 setVCP 的比例换算
+    max: int,
+    icon: string,
+    icon-text: string,
+    inputs: [PanelInput],
+    current-input: int,
+}
+
+// 单台显示器（equiv BrightnessPanel 渲染分支的 monitor 字段集）
+export struct PanelMonitor {
+    key: string,
+    id: string,
+    name: string,
+    display-type: DisplayType,
+    brightness: float,
+    minimum: float,
+    maximum: float,
+    num: int,
+    // isAdjustableDisplay(monitor)
+    adjustable: bool,
+    // showPowerButton()：monitorFeatures["0xD6"] 且 features["0xD6"] 或自定义特征启用
+    show-power: bool,
+    // features["0xD6"][0] >= 4 -> 显示"打开"
+    power-on: bool,
+    // isHDROnlySDR
+    hdr-only-sdr: bool,
+    // useFeatures && hasFeatures -> 扩展布局
+    extended: bool,
+    features: [PanelFeature],
+}
+
+component IconButton inherits Rectangle {
+    in property <string> glyph: "\u{e713}";
+    in property <string> tip: "";
+    in property <bool> active: false;
+    callback clicked;
+    width: 26px;
+    height: 26px;
+    background: transparent;
+    Text {
+        text: root.glyph;
+        font-family: "Segoe MDL2 Assets";
+        font-size: 18px;
+        color: root.active ? Theme.accent-medium : (ta.has-hover ? Theme.titlebar-icon-hover : Theme.titlebar-icon);
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+// 自绘滑块（equiv Slider.jsx：range + progress + 数值框 + 滚轮）
+component TtSlider inherits Rectangle {
+    in property <float> level: 50;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <float> scroll-amount: 2;
+    in property <bool> enabled: true;
+    callback changed(float);
+
+    width: 100%;
+    height: 20px;
+    background: transparent;
+
+    property <float> capped: clamp(root.level, root.minimum, root.maximum);
+    property <float> ratio: (root.maximum > root.minimum) ? clamp((root.capped - root.minimum) / (root.maximum - root.minimum), 0, 1) : 0;
+
+    // 轨道（equiv .range / .progress）
+    Rectangle {
+        y: (parent.height - 5px) / 2;
+        width: parent.width;
+        height: 5px;
+        border-radius: 2.5px;
+        background: Theme.slider-track;
+    }
+    Rectangle {
+        y: (parent.height - 5px) / 2;
+        width: parent.width * root.ratio;
+        height: 5px;
+        border-radius: 2.5px;
+        background: Theme.accent-medium;
+    }
+    // 滑块手柄（equiv .range::-webkit-slider-thumb）
+    Rectangle {
+        x: (parent.width - 14px) * root.ratio;
+        y: (parent.height - 14px) / 2;
+        width: 14px;
+        height: 14px;
+        border-radius: 7px;
+        background: Theme.accent-medium;
+        border-width: 1px;
+        border-color: Theme.slider-thumb-border;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.level-from-x(self.mouse-x);
+                return EventResult.accept;
+            }
+            if (e.kind == PointerEventKind.move && self.pressed) {
+                root.level-from-x(self.mouse-x);
+                return EventResult.accept;
+            }
+            EventResult.reject
+        }
+        scroll-event(e) => {
+            if (!root.enabled) {
+                reject
+            } else {
+                // equiv Slider.jsx handleWheel：Math.sign(deltaY) * -1 * scrollAmount
+                root.level-from-step(root.sign-of(e.delta-y / 1px) * -1 * root.scroll-amount);
+                accept
             }
         }
+    }
 
+    pure function sign-of(v: float) -> float {
+        if (v > 0) { return 1; }
+        if (v < 0) { return -1; }
+        return 0;
+    }
+
+    // 点击/拖拽 -> 亮度（等价 input[type=range] 的取值语义）
+    public function level-from-x(x: length) {
+        if (root.maximum <= root.minimum) { return; }
+        let ratio-from-x = clamp((x - 7px) / max(root.width - 14px, 1px), 0, 1);
+        let new-level = round(root.minimum + ratio-from-x * (root.maximum - root.minimum));
+        if (new-level != round(root.level)) {
+            root.changed(new-level);
+        }
+    }
+
+    // 滚轮步进（等价 handleWheel）
+    public function level-from-step(delta: float) {
+        let new-level = round(clamp(root.level + delta, root.minimum, root.maximum));
+        if (new-level != round(root.level)) {
+            root.changed(new-level);
+        }
+    }
+}
+
+// 数值框（equiv input.val：点击可编辑，回车/失焦提交）
+component ValueBox inherits Rectangle {
+    in property <float> level: 0;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <bool> enabled: true;
+    callback edited(float);
+
+    width: 44px;
+    height: 20px;
+    border-radius: 4px;
+    background: editing ? Theme.input-active-bg : transparent;
+    border-width: editing ? 1px : 0px;
+    border-color: Theme.input-border;
+
+    property <bool> editing: false;
+
+    if (!editing) : Text {
+        text: "\{round(root.level)}";
+        font-size: 12px;
+        color: Theme.text;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        TouchArea {
+            enabled: root.enabled;
+            clicked => { root.editing = true; }
+        }
+    }
+    if (editing) : LineEdit {
+        text: "\{round(root.level)}";
+        horizontal-alignment: center;
+        accepted(t) => {
+            root.commit(t);
+            root.editing = false;
+        }
+    }
+
+    public function commit(t: string) {
+        if (t.is-float()) {
+            root.edited(clamp(round(t.to-float()), root.minimum, root.maximum));
+        }
+    }
+}
+
+// 亮度滑块行（equiv Slider.jsx 的 render：name-row + range + val）
+component BrightnessRow inherits Rectangle {
+    in property <string> name: "";
+    in property <string> icon: "\u{e7f4}";
+    in property <bool> show-power: false;
+    in property <bool> power-on: false;
+    in property <string> power-label-on: "";
+    in property <string> power-label-off: "";
+    in property <float> level: 50;
+    in property <float> scroll-amount: 2;
+    callback changed(float);
+    callback power-clicked;
+
+    height: 73px;
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 6px;
+        padding-top: 8px;
+        // name-row
         HorizontalLayout {
-            spacing: 4px;
-            Rectangle {
-                height: 32px;
-                TouchArea {
-                    clicked => { root.refresh-requested(); }
-                }
-                Text { text: "⟳"; }
+            height: 22px;
+            spacing: 6px;
+            Text {
+                text: root.icon;
+                font-family: "Segoe MDL2 Assets";
+                font-size: 14px;
+                color: Theme.text-mid;
+                vertical-alignment: center;
             }
-            Rectangle {
-                TouchArea {
-                    clicked => { root.sleep-displays(); }
-                }
-                Text { text: "Sleep"; }
+            Text {
+                text: root.name;
+                font-size: 13px;
+                color: Theme.text;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
             }
-            Rectangle {
-                TouchArea {
-                    clicked => { root.open-settings(); }
+            if (root.show-power) : HorizontalLayout {
+                spacing: 3px;
+                Text {
+                    text: "\u{e7e8}";
+                    font-family: "Segoe MDL2 Assets";
+                    font-size: 12px;
+                    color: Theme.text-mid;
+                    vertical-alignment: center;
                 }
-                Text { text: "⚙"; }
+                Text {
+                    text: root.power-on ? root.power-label-on : root.power-label-off;
+                    font-size: 12px;
+                    color: Theme.text-mid;
+                    vertical-alignment: center;
+                }
+                TouchArea { clicked => { root.power-clicked(); } }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            TtSlider {
+                level: root.level;
+                scroll-amount: root.scroll-amount;
+                horizontal-stretch: 1;
+                changed(v) => { root.changed(v); }
+            }
+            ValueBox {
+                level: root.level;
+                edited(v) => { root.changed(v); }
+            }
+        }
+    }
+}
+
+// 特征行（equiv .feature-row：图标 + 滑块）
+component FeatureRow inherits Rectangle {
+    in property <string> icon: "\u{e897}";
+    in property <string> icon-text: "";
+    in property <float> level: 50;
+    in property <float> scroll-amount: 2;
+    callback changed(float);
+    height: 46px;
+    background: transparent;
+
+    HorizontalLayout {
+        spacing: 8px;
+        Rectangle {
+            width: 24px;
+            background: transparent;
+            if (root.icon-text != "") : Text {
+                text: root.icon-text;
+                font-size: 12px;
+                color: Theme.text-mid;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+            if (root.icon-text == "") : Text {
+                text: root.icon;
+                font-family: "Segoe MDL2 Assets";
+                font-size: 16px;
+                color: Theme.text-mid;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+        TtSlider {
+            level: root.level;
+            scroll-amount: root.scroll-amount;
+            horizontal-stretch: 1;
+            changed(v) => { root.changed(v); }
+        }
+    }
+}
+
+// 输入源按钮组（equiv DDCCISliders.jsx 的 0x60 分支）
+component InputRow inherits Rectangle {
+    in property <[PanelInput]> inputs: [];
+    in property <int> current: 0;
+    callback picked(int);
+    background: transparent;
+    height: layout.preferred-height + 8px;
+
+    layout := VerticalLayout {
+        spacing: 4px;
+        padding-top: 4px;
+        FlexboxLayout {
+            spacing: 3px;
+            for input in root.inputs : Rectangle {
+                height: 22px;
+                width: label.preferred-width + 16px;
+                border-radius: 4px;
+                background: root.current == input.value ? Theme.accent-medium : Theme.button-bg;
+                border-width: 1px;
+                border-color: Theme.button-border;
+                label := Text {
+                    text: input.label;
+                    font-size: 11px;
+                    color: root.current == input.value ? #ffffff : Theme.text;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+                TouchArea {
+                    enabled: root.current != input.value;
+                    clicked => { root.picked(input.value); }
+                }
+            }
+        }
+    }
+}
+
+component UpdateBar inherits Rectangle {
+    in property <bool> downloading: false;
+    in property <float> progress: 0;
+    in property <string> version: "";
+    in property <string> available-label: "";
+    in property <string> install-label: "";
+    callback install-clicked;
+    callback dismiss-clicked;
+
+    background: Theme.accent;
+    height: downloading ? 34px : 40px;
+
+    if (!root.downloading) : HorizontalLayout {
+        padding-left: 15px;
+        padding-right: 15px;
+        spacing: 6px;
+        Text {
+            text: root.available-label + " (" + root.version + ")";
+            font-size: 12px;
+            color: #ffffff;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            text: root.install-label;
+            font-size: 12px;
+            color: #ffffff;
+            vertical-alignment: center;
+            font-weight: 600;
+        }
+        TouchArea { clicked => { root.install-clicked(); } }
+        Text {
+            text: "\u{ef2c}";
+            font-family: "Segoe MDL2 Assets";
+            font-size: 12px;
+            color: #ffffff;
+            vertical-alignment: center;
+        }
+        TouchArea { clicked => { root.dismiss-clicked(); } }
+    }
+    if (root.downloading) : HorizontalLayout {
+        padding-left: 15px;
+        padding-right: 15px;
+        spacing: 8px;
+        Rectangle {
+            height: 5px;
+            border-radius: 2.5px;
+            background: #ffffff33;
+            horizontal-stretch: 1;
+            Rectangle {
+                width: parent.width * clamp(root.progress, 0, 100) / 100;
+                height: parent.height;
+                border-radius: 2.5px;
+                background: #ffffff;
+            }
+        }
+        Text {
+            text: "\{round(root.progress)}%";
+            font-size: 12px;
+            color: #ffffff;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component PanelWindow inherits Window {
+    // ---- 数据（Rust 侧 model 注入）----
+    in-out property <[PanelMonitor]> monitors: [];
+    in-out property <int> visible-count: 0;
+    in-out property <bool> linked-levels: false;
+    in-out property <bool> linked-levels-available: false;
+    in-out property <bool> show-sleep: true;
+    in-out property <bool> sleeping: false;
+    in-out property <bool> is-refreshing: false;
+    in-out property <bool> acrylic: false;
+    in-out property <float> scroll-amount: 2;
+
+    // 更新提示（equiv state.update / updateProgress）
+    in-out property <bool> update-visible: false;
+    in-out property <bool> update-downloading: false;
+    in-out property <float> update-progress: 0;
+    in-out property <string> update-version: "";
+
+    // ---- 本地化文案（Translate.js 注入）----
+    in-out property <string> t-title: "Adjust Brightness";
+    in-out property <string> t-link-levels: "Link levels";
+    in-out property <string> t-turn-off-displays: "Turn off displays";
+    in-out property <string> t-settings: "Settings";
+    in-out property <string> t-no-displays: "";
+    in-out property <string> t-detecting: "";
+    in-out property <string> t-all-displays: "";
+    in-out property <string> t-turn-on: "";
+    in-out property <string> t-turn-off: "";
+    in-out property <string> t-update-available: "";
+    in-out property <string> t-install: "";
+    in-out property <string> t-dismiss: "";
+
+    // ---- 回调（Rust 侧接线到 worker）----
+    callback brightness-changed(string, float);
+    callback feature-changed(string, int, float);
+    callback input-picked(string, int, int);
+    callback power-clicked(string, bool);
+    callback link-levels-toggled;
+    callback sleep-displays;
+    callback open-settings;
+    callback refresh-requested;
+    callback escape-pressed;
+    callback install-update;
+    callback dismiss-update;
+
+    title: root.t-title;
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    width: 356px;
+    height: body.preferred-height;
+
+    // Escape 关闭面板（equiv panel.js keydown Escape -> blur-panel）
+    focus := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        key-pressed(event) => {
+            if (event.text == "\u{1b}") {
+                root.escape-pressed();
+                return accept;
+            }
+            reject
+        }
+
+        body := Rectangle {
+            background: Theme.tray-bg;
+            border-width: 1px;
+            border-color: Theme.border;
+            width: 100%;
+
+            content := VerticalLayout {
+                padding-left: 15px;
+                padding-right: 15px;
+                spacing: 0px;
+
+                // ---- titlebar（equiv .titlebar）----
+                HorizontalLayout {
+                    height: 44px;
+                    spacing: 8px;
+                    Text {
+                        text: root.t-title;
+                        font-size: 14.5px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    if (root.linked-levels-available) : IconButton {
+                        glyph: "\u{e71b}";
+                        tip: root.t-link-levels;
+                        active: root.linked-levels;
+                        clicked => { root.link-levels-toggled(); }
+                    }
+                    if (root.show-sleep) : IconButton {
+                        glyph: "\u{f71d}";
+                        tip: root.t-turn-off-displays;
+                        clicked => { root.sleep-displays(); }
+                    }
+                    IconButton {
+                        glyph: "\u{e713}";
+                        tip: root.t-settings;
+                        clicked => { root.open-settings(); }
+                    }
+                }
+
+                // ---- 显示器列表（equiv getMonitors()）----
+                if (root.sleeping) : Rectangle { height: 0px; }
+                if (!root.sleeping && root.visible-count == 0) : Rectangle {
+                    height: 60px;
+                    background: transparent;
+                    Text {
+                        text: root.is-refreshing ? root.t-detecting : root.t-no-displays;
+                        font-size: 13px;
+                        color: Theme.text;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+                // 联动：只显示一条"所有显示器"滑块（equiv lastValidMonitor 分支）
+                if (!root.sleeping && root.linked-levels && root.visible-count > 0) : VerticalLayout {
+                    spacing: 0px;
+                    for monitor in root.monitors : BrightnessRow {
+                        visible: monitor.adjustable;
+                        name: root.t-all-displays;
+                        icon: monitor.display-type == DisplayType.wmi ? "\u{e770}" : "\u{e7f4}";
+                        level: monitor.brightness;
+                        scroll-amount: root.scroll-amount;
+                        show-power: monitor.show-power;
+                        power-on: monitor.power-on;
+                        power-label-on: root.t-turn-on;
+                        power-label-off: root.t-turn-off;
+                        changed(v) => { root.brightness-changed(monitor.key, v); }
+                        power-clicked => { root.power-clicked(monitor.key, monitor.power-on); }
+                    }
+                }
+                if (!root.sleeping && !root.linked-levels) : VerticalLayout {
+                    spacing: 0px;
+                    for monitor in root.monitors : VerticalLayout {
+                        visible: monitor.adjustable;
+                        spacing: 0px;
+
+                        if (!monitor.extended) : BrightnessRow {
+                            name: monitor.name;
+                            icon: monitor.display-type == DisplayType.wmi ? "\u{e770}" : "\u{e7f4}";
+                            level: monitor.brightness;
+                            scroll-amount: root.scroll-amount;
+                            show-power: monitor.show-power;
+                            power-on: monitor.power-on;
+                            power-label-on: root.t-turn-on;
+                            power-label-off: root.t-turn-off;
+                            changed(v) => { root.brightness-changed(monitor.key, v); }
+                            power-clicked => { root.power-clicked(monitor.key, monitor.power-on); }
+                        }
+                        if (!monitor.extended && monitor.hdr-only-sdr) : VerticalLayout {
+                            spacing: 0px;
+                            for feature in monitor.features : FeatureRow {
+                                icon: "\u{e706}";
+                                icon-text: feature.icon-text;
+                                level: feature.level;
+                                scroll-amount: root.scroll-amount;
+                                changed(v) => { root.feature-changed(monitor.key, feature.code, v); }
+                            }
+                        }
+                        if (monitor.extended) : VerticalLayout {
+                            spacing: 0px;
+                            // 扩展布局：name-row + 亮度行 + DDC/CI 特征行（equiv .monitor-sliders.extended）
+                            Rectangle {
+                                height: 40px;
+                                background: transparent;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    padding-top: 8px;
+                                    Text {
+                                        text: monitor.display-type == DisplayType.wmi ? "\u{e770}" : "\u{e7f4}";
+                                        font-family: "Segoe MDL2 Assets";
+                                        font-size: 14px;
+                                        color: Theme.text-mid;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: monitor.name;
+                                        font-size: 13px;
+                                        color: Theme.text;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    if (monitor.show-power) : HorizontalLayout {
+                                        spacing: 3px;
+                                        Text {
+                                            text: "\u{e7e8}";
+                                            font-family: "Segoe MDL2 Assets";
+                                            font-size: 12px;
+                                            color: Theme.text-mid;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: monitor.power-on ? root.t-turn-on : root.t-turn-off;
+                                            font-size: 12px;
+                                            color: Theme.text-mid;
+                                            vertical-alignment: center;
+                                        }
+                                        TouchArea { clicked => { root.power-clicked(monitor.key, monitor.power-on); } }
+                                    }
+                                }
+                            }
+                            if (!monitor.hdr-only-sdr) : FeatureRow {
+                                icon: "\u{e706}";
+                                level: monitor.brightness;
+                                scroll-amount: root.scroll-amount;
+                                changed(v) => { root.brightness-changed(monitor.key, v); }
+                            }
+                            for feature in monitor.features : VerticalLayout {
+                                spacing: 0px;
+                                if (feature.kind == FeatureKind.inputs) : InputRow {
+                                    inputs: feature.inputs;
+                                    current: feature.current-input;
+                                    picked(v) => { root.input-picked(monitor.key, feature.code, v); }
+                                }
+                                if (feature.kind != FeatureKind.inputs) : FeatureRow {
+                                    icon: feature.icon;
+                                    icon-text: feature.icon-text;
+                                    level: feature.level;
+                                    scroll-amount: root.scroll-amount;
+                                    changed(v) => { root.feature-changed(monitor.key, feature.code, v); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- 更新条（equiv .updateBar）----
+                if (root.update-visible || root.update-downloading) : UpdateBar {
+                    downloading: root.update-downloading;
+                    progress: root.update-progress;
+                    version: root.update-version;
+                    available-label: root.t-update-available;
+                    install-label: root.t-install;
+                    install-clicked => { root.install-update(); }
+                    dismiss-clicked => { root.dismiss-update(); }
+                }
+                Rectangle { height: 15px; background: transparent; }
             }
         }
     }

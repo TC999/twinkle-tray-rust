@@ -177,5 +177,38 @@ impl MonitorHost {
     }
 }
 
+/// parseBrightnessVCP 等价（equiv electron.js:L2335-L2338）：
+/// 字符串按十六进制解析（"13" = 0x13），数字原样；非 1..=0xFF 视为不可用。
+pub fn parse_brightness_vcp(value: &Value) -> Option<u8> {
+    let code = match value {
+        Value::String(s) => u8::from_str_radix(s.trim().trim_start_matches("0x").trim_start_matches("0X"), 16).ok(),
+        Value::Number(n) => n.as_u64().map(|v| v as u8),
+        _ => None,
+    }?;
+    if (0x01..=0xFF).contains(&code) {
+        Some(code)
+    } else {
+        None
+    }
+}
+
+/// getDDCBrightnessVCPs 等价（equiv electron.js:L2340-L2353）：
+/// knownDDCBrightnessVCPs 与 userDDCBrightnessVCPs 合并后逐个校验，无效项删除。
+pub fn ddc_brightness_vcps(settings: &Value) -> Value {
+    let mut merged = json!({});
+    let user = settings
+        .get("userDDCBrightnessVCPs")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for (k, v) in user {
+        if let Some(code) = parse_brightness_vcp(&v) {
+            merged[k] = json!(code);
+        }
+        // 不可用的码直接丢弃（原版 delete ids[mon]）
+    }
+    merged
+}
+
 /// 事件回调类型别名（便于 lib.rs 引用，避免重复写 trait 约束）。
 pub type EventCallback = Arc<dyn Fn(&Json) + Send + Sync>;

@@ -1,62 +1,525 @@
-// 设置窗口。
-// 等价 origin/src/settings.js 的功能项（AGENTS.md §4: 每个设置开关都要有对应物）。
-// 分类对应 components/Settings/:
-//   General / Monitor Features / Hotkeys / Time Adjustments / Sleep &
-//   Idle / Profiles / Notifications / Advanced / About
-import { TabWidget } from "std-widgets.slint";
+// 设置窗口（equiv: origin/src/components/SettingsWindow.jsx + components/SettingsOption.jsx）。
+//
+// 结构：标题栏 + 左侧导航（7 页，对应源 getSidebar 的 7 项）+ 右侧滚动内容区。
+// 内容由 Rust 侧按原版页面顺序构建成 SettingsItem 列表注入（数据驱动），
+// 每个开关/下拉/按钮都与 SettingsWindow.jsx 的设置项一一对应。
+import { Theme } from "theme.slint";
+import { LineEdit, ScrollView } from "std-widgets.slint";
+
+export enum SettingsItemKind {
+    toggle,
+    select,
+    button,
+    number,
+    text,
+    note,
+    section,
+}
+
+export struct SettingsChoice {
+    value: string,
+    label: string,
+}
+
+export struct SettingsItem {
+    kind: SettingsItemKind,
+    key: string,
+    title: string,
+    description: string,
+    toggle-value: bool,
+    text-value: string,
+    options: [SettingsChoice],
+    // 当前选中项的显示文本（Rust 侧按 text-value 查 options 得出，Slint 函数不支持遍历 model）
+    selected-label: string,
+    // 点击下拉后应切到的下一个值（equiv <select> 轮换语义，由 Rust 侧计算）
+    next-value: string,
+    button-label: string,
+    disabled: bool,
+}
+
+export struct SettingsPage {
+    id: string,
+    label: string,
+    glyph: string,
+}
+
+// 显示器设置行（equiv renderMonitorInfo / 重命名 / 隐藏 / gamma / extend minimum / SDR）
+export struct SettingsMonitorEntry {
+    key: string,
+    id: string,
+    name: string,
+    rename: string,
+    hidden: bool,
+    gamma: bool,
+    sdr: bool,
+    extend-minimum: bool,
+    breakpoint: int,
+    // 连接方式（equiv getDebugMonitorType）
+    connection: string,
+    hdr: string,
+    brightness: string,
+    maximum: string,
+    normalization: string,
+}
+
+export struct SettingsHotkey {
+    id: string,
+    accelerator: string,
+    summary: string,
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label: "";
+    in property <string> glyph: "";
+    in property <bool> active: false;
+    callback clicked;
+    height: 34px;
+    border-radius: 4px;
+    background: root.active ? Theme.sidebar-item-hover : (ta.has-hover ? Theme.sidebar-item-hover : transparent);
+
+    HorizontalLayout {
+        padding-left: 10px;
+        spacing: 10px;
+        Text {
+            text: root.glyph;
+            font-family: "Segoe MDL2 Assets";
+            font-size: 14px;
+            color: Theme.text-mid;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            font-size: 13px;
+            color: Theme.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component Toggle inherits Rectangle {
+    in property <bool> checked: false;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    width: 40px;
+    height: 20px;
+    border-radius: 10px;
+    background: root.checked ? Theme.accent-medium : Theme.button-bg;
+    border-width: 1px;
+    border-color: Theme.button-border;
+    opacity: root.enabled ? 1 : 0.5;
+
+    Rectangle {
+        x: root.checked ? parent.width - 14px : 3px;
+        y: 3px;
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: root.checked ? #ffffff : Theme.text-mid;
+    }
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.toggled(!root.checked); }
+    }
+}
+
+// SettingsOption（equiv SettingsOption.jsx：title + description + input 右侧控件）
+component SettingsRow inherits Rectangle {
+    in property <SettingsItem> item;
+    callback toggle-changed(bool);
+    callback choice-picked(string);
+    callback button-clicked;
+    background: transparent;
+
+    height: Math.max(48px, layout.preferred-height + 16px);
+    layout := VerticalLayout {
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.item.title;
+                    font-size: 13px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+                if (root.item.description != "") : Text {
+                    text: root.item.description;
+                    font-size: 11px;
+                    color: Theme.text-mid;
+                    wrap: word-wrap;
+                }
+            }
+            if (root.item.kind == SettingsItemKind.toggle) : Toggle {
+                checked: root.item.toggle-value;
+                enabled: !root.item.disabled;
+                toggled(v) => { root.toggle-changed(v); }
+            }
+            if (root.item.kind == SettingsItemKind.select) : Rectangle {
+                width: 150px;
+                height: 26px;
+                border-radius: 4px;
+                background: Theme.button-bg;
+                border-width: 1px;
+                border-color: Theme.button-border;
+                Text {
+                    text: root.item.selected-label;
+                    font-size: 12px;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                    overflow: elide;
+                }
+                TouchArea {
+                    enabled: !root.item.disabled;
+                    clicked => { root.choice-picked(root.item.next-value); }
+                }
+            }
+            if (root.item.kind == SettingsItemKind.button) : Rectangle {
+                width: Math.max(80px, bl.preferred-width + 24px);
+                height: 26px;
+                border-radius: 4px;
+                background: Theme.button-bg;
+                border-width: 1px;
+                border-color: Theme.button-border;
+                bl := Text {
+                    text: root.item.button-label;
+                    font-size: 12px;
+                    color: Theme.text;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+                TouchArea {
+                    enabled: !root.item.disabled;
+                    clicked => { root.button-clicked(); }
+                }
+            }
+            if (root.item.kind == SettingsItemKind.number) : Rectangle {
+                width: 70px;
+                height: 26px;
+                border-radius: 4px;
+                background: Theme.button-bg;
+                border-width: 1px;
+                border-color: Theme.button-border;
+                LineEdit {
+                    text: root.item.text-value;
+                    horizontal-alignment: center;
+                    accepted(t) => { root.choice-picked(t); }
+                }
+            }
+            if (root.item.kind == SettingsItemKind.text) : Rectangle {
+                width: 150px;
+                height: 26px;
+                border-radius: 4px;
+                background: Theme.button-bg;
+                border-width: 1px;
+                border-color: Theme.button-border;
+                LineEdit {
+                    text: root.item.text-value;
+                    horizontal-alignment: center;
+                    accepted(t) => { root.choice-picked(t); }
+                }
+            }
+        }
+    }
+
+}
 
 export component SettingsWindow inherits Window {
-    in-out property <string> settings-json: "{}";
-    callback settings-changed(string /* key */, string /* value json */);
-    callback request-close();
+    // ---- 数据（Rust 侧注入）----
+    in-out property <[SettingsPage]> pages: [];
+    in-out property <[SettingsItem]> items: [];
+    in-out property <[SettingsMonitorEntry]> monitors: [];
+    in-out property <[SettingsHotkey]> hotkeys: [];
+    in-out property <string> active-page: "general";
+    in-out property <bool> dark: false;
+    in-out property <bool> win11: true;
 
-    title: "Twinkle Tray Settings";
-    width: 720px;
+    // ---- 本地化 ----
+    in-out property <string> t-title: "Settings";
+    in-out property <string> t-monitors-rename: "";
+    in-out property <string> t-monitors-hide: "";
+    in-out property <string> t-monitors-gamma: "";
+    in-out property <string> t-monitors-sdr: "";
+    in-out property <string> t-monitors-extend-minimum: "";
+    in-out property <string> t-hotkeys-add: "";
+    in-out property <string> t-hotkeys-remove: "";
+    in-out property <string> t-hotkeys-record: "";
+    in-out property <string> t-no-hotkeys: "";
+    in-out property <string> t-ddc-warning: "";
+    in-out property <string> t-move-up: "";
+    in-out property <string> t-move-down: "";
+
+    // ---- 回调（Rust 侧接线）----
+    callback page-changed(string);
+    callback item-toggle(string, bool);
+    callback item-choice(string, string);
+    callback item-button(string);
+    callback monitor-renamed(string, string);
+    callback monitor-hidden(string, bool);
+    callback monitor-gamma(string, bool);
+    callback monitor-sdr(string, bool);
+    callback monitor-extend-minimum(string, bool);
+    callback monitor-breakpoint(string, int);
+    callback monitor-moved(string, int);
+    callback hotkey-add;
+    callback hotkey-remove(string);
+    callback hotkey-record(string);
+    callback window-minimize;
+    callback window-maximize;
+    callback window-close;
+
+    title: root.t-title;
+    no-frame: true;
+    background: Theme.page-bg;
+    width: 760px;
     height: 560px;
 
-    TabWidget {
-        Tab {
-            title: "General";
-            VerticalLayout {
-                spacing: 8px;
-                // language / theme / icon / openAtLogin / brightnessAtStartup / checkForUpdates / analytics
-                Text { text: "Language / Theme / Startup / Updates"; }
+    VerticalLayout {
+        // ---- 标题栏（equiv Titlebar.jsx + .window-titlebar）----
+        HorizontalLayout {
+            height: 32px;
+            padding-left: 12px;
+            Text {
+                text: root.t-title;
+                font-size: 12px;
+                color: Theme.text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Rectangle {
+                width: 44px;
+                height: 32px;
+                background: ta1.has-hover ? Theme.sidebar-item-hover : transparent;
+                Text { text: "\u{e921}"; font-family: "Segoe MDL2 Assets"; font-size: 10px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                ta1 := TouchArea { clicked => { root.window-minimize(); } }
+            }
+            Rectangle {
+                width: 44px;
+                height: 32px;
+                background: ta2.has-hover ? Theme.sidebar-item-hover : transparent;
+                Text { text: "\u{e922}"; font-family: "Segoe MDL2 Assets"; font-size: 10px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                ta2 := TouchArea { clicked => { root.window-maximize(); } }
+            }
+            Rectangle {
+                width: 44px;
+                height: 32px;
+                background: ta3.has-hover ? #c42b1c : transparent;
+                Text { text: "\u{e8bb}"; font-family: "Segoe MDL2 Assets"; font-size: 10px; color: ta3.has-hover ? #ffffff : Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                ta3 := TouchArea { clicked => { root.window-close(); } }
             }
         }
-        Tab {
-            title: "Monitor Features";
-            VerticalLayout {
-                // monitorFeatures / disableDDCDisplays / userDDCBrightnessVCPs / remaps
-                Text { text: "Per-monitor VCP features and DDC blocking"; }
+
+        HorizontalLayout {
+            // ---- 侧边栏（equiv #sidebar）----
+            Rectangle {
+                width: 180px;
+                background: transparent;
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 2px;
+                    for page in root.pages : NavItem {
+                        label: page.label;
+                        glyph: page.glyph;
+                        active: root.active-page == page.id;
+                        clicked => { root.page-changed(page.id); }
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                }
             }
-        }
-        Tab {
-            title: "Hotkeys";
-            VerticalLayout {
-                // hotkeys / hotkeyPercent / hotkeysBreakLinkedLevels
-                Text { text: "Global hotkeys"; }
-            }
-        }
-        Tab {
-            title: "Time Adjustments";
-            VerticalLayout {
-                // adjustmentTimes / adjustmentTimeSpeed / Longitude / Latitude（suncalc）
-                Text { text: "Scheduled brightness by time / sun"; }
-            }
-        }
-        Tab {
-            title: "Sleep & Idle";
-            VerticalLayout {
-                // detectIdleTime* / idleRestoreSeconds / wakeRestoreSeconds / restartOnWake
-                Text { text: "Idle detection and restore timing"; }
-            }
-        }
-        Tab {
-            title: "Advanced";
-            VerticalLayout {
-                // updateInterval / checkVCPWaitMS / preferredDDCCIMethod / disableWMI 等
-                // 双事件源开关（useWin32Event/useElectronEvents/useWmDisplayChangeEvent/...）
-                Text { text: "Diagnostic switches (dual event sources)"; }
+
+            // ---- 内容区 ----
+            Rectangle {
+                background: Theme.page-bg;
+                horizontal-stretch: 1;
+                ScrollView {
+                    content-width: self.width;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 4px;
+
+                        // 通用设置页（general / features / time / updates）
+                        if (root.active-page != "monitors" && root.active-page != "hotkeys") : VerticalLayout {
+                            spacing: 4px;
+                            for item in root.items : VerticalLayout {
+                                spacing: 0px;
+                                if (item.kind == SettingsItemKind.section) : Rectangle {
+                                    height: 34px;
+                                    background: transparent;
+                                    Text {
+                                        text: item.title;
+                                        font-size: 13px;
+                                        font-weight: 600;
+                                        color: Theme.text;
+                                        vertical-alignment: bottom;
+                                    }
+                                }
+                                if (item.kind == SettingsItemKind.note) : Text {
+                                    text: item.title;
+                                    font-size: 12px;
+                                    color: Theme.text-mid;
+                                    wrap: word-wrap;
+                                }
+                                if (item.kind != SettingsItemKind.section && item.kind != SettingsItemKind.note) : SettingsRow {
+                                    item: item;
+                                    toggle-changed(v) => { root.item-toggle(item.key, v); }
+                                    choice-picked(v) => { root.item-choice(item.key, v); }
+                                    button-clicked => { root.item-button(item.key); }
+                                }
+                            }
+                        }
+
+                        // 显示器页（equiv monitors 页：重命名 / 隐藏 / 排序 / gamma / extend minimum / SDR）
+                        if (root.active-page == "monitors") : VerticalLayout {
+                            spacing: 8px;
+                            for monitor in root.monitors : Rectangle {
+                                height: entry.preferred-height + 12px;
+                                border-radius: 4px;
+                                background: Theme.page-section-bg;
+                                entry := VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 4px;
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: monitor.connection + " · " + monitor.name;
+                                            font-size: 12px;
+                                            font-weight: 600;
+                                            color: Theme.text;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                            overflow: elide;
+                                        }
+                                        Text { text: "\u{e70e}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: Theme.text-mid; vertical-alignment: center; }
+                                        TouchArea { clicked => { root.monitor-moved(monitor.key, -1); } }
+                                        Text { text: "\u{e70d}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: Theme.text-mid; vertical-alignment: center; }
+                                        TouchArea { clicked => { root.monitor-moved(monitor.key, 1); } }
+                                    }
+                                    Text {
+                                        text: monitor.brightness + " · HDR: " + monitor.hdr + " · " + monitor.normalization;
+                                        font-size: 11px;
+                                        color: Theme.text-mid;
+                                        wrap: word-wrap;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Rectangle {
+                                            height: 24px;
+                                            border-radius: 4px;
+                                            background: Theme.button-bg;
+                                            border-width: 1px;
+                                            border-color: Theme.button-border;
+                                            horizontal-stretch: 1;
+                                            LineEdit {
+                                                text: monitor.rename;
+                                                placeholder-text: root.t-monitors-rename;
+                                                accepted(t) => { root.monitor-renamed(monitor.key, t); }
+                                            }
+                                        }
+                                        Text { text: root.t-monitors-hide; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
+                                        Toggle { checked: monitor.hidden; toggled(v) => { root.monitor-hidden(monitor.key, v); } }
+                                        Text { text: root.t-monitors-gamma; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
+                                        Toggle { checked: monitor.gamma; toggled(v) => { root.monitor-gamma(monitor.key, v); } }
+                                        Text { text: root.t-monitors-sdr; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
+                                        Toggle { checked: monitor.sdr; toggled(v) => { root.monitor-sdr(monitor.key, v); } }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text { text: root.t-monitors-extend-minimum; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
+                                        Toggle { checked: monitor.extend-minimum; toggled(v) => { root.monitor-extend-minimum(monitor.key, v); } }
+                                        if (monitor.extend-minimum) : Rectangle {
+                                            width: 60px;
+                                            height: 24px;
+                                            border-radius: 4px;
+                                            background: Theme.button-bg;
+                                            border-width: 1px;
+                                            border-color: Theme.button-border;
+                                            LineEdit {
+                                                text: "\{monitor.breakpoint}";
+                                                horizontal-alignment: center;
+                                                accepted(t) => { root.monitor-breakpoint(monitor.key, t.to-float()); }
+                                            }
+                                        }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 热键页（equiv hotkeys 页）
+                        if (root.active-page == "hotkeys") : VerticalLayout {
+                            spacing: 6px;
+                            if (root.hotkeys.length == 0) : Text {
+                                text: root.t-no-hotkeys;
+                                font-size: 12px;
+                                color: Theme.text-mid;
+                            }
+                            for hotkey in root.hotkeys : Rectangle {
+                                height: 40px;
+                                border-radius: 4px;
+                                background: Theme.page-section-bg;
+                                HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: hotkey.accelerator;
+                                        font-size: 12px;
+                                        font-family: "Consolas";
+                                        color: Theme.text;
+                                        vertical-alignment: center;
+                                        width: 140px;
+                                    }
+                                    Text {
+                                        text: hotkey.summary;
+                                        font-size: 12px;
+                                        color: Theme.text-mid;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    Rectangle {
+                                        width: 70px;
+                                        height: 24px;
+                                        border-radius: 4px;
+                                        background: Theme.button-bg;
+                                        border-width: 1px;
+                                        border-color: Theme.button-border;
+                                        Text { text: root.t-hotkeys-record; font-size: 11px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                                        TouchArea { clicked => { root.hotkey-record(hotkey.id); } }
+                                    }
+                                    Rectangle {
+                                        width: 26px;
+                                        height: 24px;
+                                        border-radius: 4px;
+                                        background: Theme.button-bg;
+                                        border-width: 1px;
+                                        border-color: Theme.button-border;
+                                        Text { text: "\u{e74d}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                                        TouchArea { clicked => { root.hotkey-remove(hotkey.id); } }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                height: 28px;
+                                width: 140px;
+                                border-radius: 4px;
+                                background: Theme.button-bg;
+                                border-width: 1px;
+                                border-color: Theme.button-border;
+                                Text { text: "+ " + root.t-hotkeys-add; font-size: 12px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                                TouchArea { clicked => { root.hotkey-add(); } }
+                            }
+                        }
+
+                        Rectangle { height: 16px; background: transparent; }
+                    }
+                }
             }
         }
     }

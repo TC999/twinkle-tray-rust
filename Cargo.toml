@@ -30,6 +30,16 @@ serde_json = "1"
 ddcci = { path = "crates/ddcci" }
 slint = { version = "1.19", features = ["backend-winit", "renderer-femtovg"] }
 wmibridge = { path = "crates/wmibridge" }
+twutils = { path = "crates/twutils" }
+tray = { path = "crates/tray" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
 
 [build-dependencies]
 slint-build = "1.19"

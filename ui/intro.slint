@@ -1,20 +1,109 @@
-// 首次运行引导窗口。
-// 等价 origin/src/intro.js：欢迎步骤 + 权限说明 + userClosedIntro 设置。
-export component IntroWindow inherits Window {
-    in-out property <int> step: 0;
-    callback next-step();
-    callback finished(); // 等价 "close-intro" -> userClosedIntro = true
+// 首次运行引导窗口（equiv: origin/src/components/IntroWindow.jsx + css/intro.scss）。
+// 内容：logo + 标题 + 说明 + 托盘图标位置示意图 + 关闭按钮（close-intro -> userClosedIntro = true）。
+import { Theme } from "theme.slint";
 
-    title: "Welcome to Twinkle Tray";
-    width: 480px;
-    height: 320px;
+export component IntroWindow inherits Window {
+    in-out property <string> t-title: "Hello, Twinkle Tray!";
+    in-out property <string> t-instructions: "";
+    in-out property <string> t-close: "Close";
+    // 托盘图标位置示意（equiv intro.scss 的 .tray-icons 高亮块：taskbar-position 决定方向）
+    in-out property <int> taskbar-position: 3; // 0=left 1=top 2=right 3=bottom
+    in-out property <bool> dark: false;
+
+    callback close-requested;
+    callback open-url(string);
+
+    title: root.t-title;
+    no-frame: true;
+    background: Theme.page-bg;
+    width: 560px;
+    height: 480px;
 
     VerticalLayout {
-        spacing: 12px;
-        Text { text: step == 0 ? "Welcome!" : "You're all set!"; }
+        padding: 24px;
+        spacing: 14px;
+        alignment: start;
+
+        // logo（equiv <img src={AppLogo} />，用文字标识代替位图以保持纯 Slint 资产）
+        Text {
+            text: "Twinkle Tray";
+            font-size: 26px;
+            font-weight: 600;
+            color: Theme.accent-medium;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.t-title;
+            font-size: 20px;
+            color: Theme.text;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.t-instructions;
+            font-size: 13px;
+            color: Theme.text-mid;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+
+        // 托盘示意图（equiv intro.scss 的任务栏示意图：底部/顶部/左侧/右侧高亮）
         Rectangle {
-            TouchArea { clicked => { root.finished(); } }
-            Text { text: "Get Started"; }
+            height: 150px;
+            background: Theme.page-section-bg;
+            border-radius: 6px;
+            border-width: 1px;
+            border-color: Theme.window-border;
+
+            // 屏幕区
+            Rectangle {
+                x: root.taskbar-position == 0 ? 44px : 12px;
+                y: root.taskbar-position == 1 ? 44px : 12px;
+                width: parent.width - (root.taskbar-position == 0 || root.taskbar-position == 2 ? 56px : 24px);
+                height: parent.height - (root.taskbar-position == 1 || root.taskbar-position == 3 ? 56px : 24px);
+                background: Theme.page-bg;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: Theme.window-border;
+            }
+            // 任务栏（高亮托盘图标所在角）
+            Rectangle {
+                x: root.taskbar-position == 0 ? 12px : (root.taskbar-position == 2 ? parent.width - 44px : 12px);
+                y: root.taskbar-position == 1 ? 12px : (root.taskbar-position == 3 ? parent.height - 44px : 12px);
+                width: root.taskbar-position == 1 || root.taskbar-position == 3 ? parent.width - 24px : 32px;
+                height: root.taskbar-position == 0 || root.taskbar-position == 2 ? parent.height - 24px : 32px;
+                background: Theme.sidebar-item-hover;
+                border-radius: 4px;
+            }
+            // 托盘图标标记（Windows 10/11 的右下角，equiv intro 动画的闪烁点）
+            Rectangle {
+                x: root.taskbar-position == 0 ? 18px : (root.taskbar-position == 2 ? parent.width - 38px : parent.width - 60px);
+                y: root.taskbar-position == 1 ? 18px : (root.taskbar-position == 3 ? parent.height - 38px : parent.height - 60px);
+                width: 20px;
+                height: 20px;
+                border-radius: 10px;
+                background: Theme.accent;
+            }
+        }
+
+        Rectangle { vertical-stretch: 1; background: transparent; }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Rectangle {
+                width: 120px;
+                height: 32px;
+                border-radius: 4px;
+                background: Theme.accent-medium;
+                Text {
+                    text: root.t-close;
+                    font-size: 13px;
+                    color: #ffffff;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+                TouchArea { clicked => { root.close-requested(); } }
+            }
         }
     }
 }

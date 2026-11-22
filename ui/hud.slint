@@ -1,20 +1,55 @@
-// HUD 浮层（热键调节亮度时的覆盖显示）。
-// 等价 components/HUD/ 功能：半透明圆角 + 当前亮度值，自动隐藏。
+// 亮度 HUD 浮层（equiv: origin/src/electron.js hotkeyOverlay 系列 + panel.scss 的 .overlay）。
+// 半透明圆角浮层，显示当前亮度/特征值，2 秒后自动隐藏（由 Rust 侧定时器驱动 visible）。
+import { Theme } from "theme.slint";
+
 export component HudWindow inherits Window {
-    in-out property <int> brightness: 50;
-    in-out property <bool> visible-state: false;
+    in-out property <float> level: 50;
+    in-out property <string> label: "";
+    in-out property <bool> show-value: true;
 
     width: 120px;
-    height: 48px;
+    height: 56px;
     always-on-top: true;
     no-frame: true;
+    background: transparent;
 
     Rectangle {
         border-radius: 8px;
-        background: #80000000;
-        Text {
-            text: brightness + "%";
-            color: #ffffff;
+        background: #cc1f1f1f;
+        border-width: 1px;
+        border-color: #44ffffff;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.label;
+                font-size: 11px;
+                color: #dddddd;
+                horizontal-alignment: center;
+                overflow: elide;
+            }
+            if (root.show-value) : Text {
+                text: "\{round(root.level)}%";
+                font-size: 18px;
+                font-weight: 600;
+                color: #ffffff;
+                horizontal-alignment: center;
+            }
+            // 进度条（equiv HUD 的亮度条）
+            bar := Rectangle {
+                height: 3px;
+                x: 12px;
+                width: parent.width - 24px;
+                border-radius: 1.5px;
+                background: #44ffffff;
+                Rectangle {
+                    width: parent.width * clamp(root.level, 0, 100) / 100;
+                    height: parent.height;
+                    border-radius: 1.5px;
+                    background: Theme.accent-medium;
+                }
+            }
         }
     }
 }

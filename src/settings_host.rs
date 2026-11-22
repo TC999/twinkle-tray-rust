@@ -1,0 +1,503 @@
+//! 设置窗口宿主：创建窗口、接线回调、把改动写回 settings 并下发 worker。
+//!
+//! equiv: origin/src/settings.js + electron.js 的 createSettings（L3645）
+//! + ipcMain.on('send-settings')（L2367-L2374）+ writeSettings/processSettings
+//! （L1221-L1471）的 UI 可达子集。
+//!
+//! 线程模型（AGENTS.md §5）：Slint 窗口只在主线程（事件循环线程）创建，
+//! 与面板共享同一个 Slint 后端与事件循环——等价 Electron 的多 BrowserWindow。
+
+use crate::settings_view;
+use crate::window_state;
+use serde_json::{json, Value};
+use slint::ComponentHandle;
+use std::sync::{Arc, Mutex};
+
+/// 设置窗口句柄（调用方需持有，drop 即销毁窗口）。
+pub struct SettingsWindowHandle {
+    pub ui: crate::SettingsWindow,
+}
+
+/// 在当前（主）线程创建并显示设置窗口。
+/// settings 为共享的可写设置；worker 为下发通道（可为 None 的纯预览模式）。
+pub fn open_settings_window(
+    settings: Arc<Mutex<Value>>,
+    host: Arc<crate::monitor_host::MonitorHost>,
+) -> Result<SettingsWindowHandle, String> {
+    let ui = crate::SettingsWindow::new().map_err(|e| e.to_string())?;
+    let snapshot = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
+
+    window_state::apply_settings_theme(&ui, &snapshot);
+    ui.set_pages(settings_view::model(settings_view::build_pages()));
+    ui.set_hotkeys(settings_view::model(settings_view::build_hotkeys(&snapshot)));
+    ui.set_items(settings_view::model(settings_view::build_items(
+        "general",
+        &snapshot,
+    )));
+    apply_texts(&ui);
+
+    wire_callbacks(&ui, settings.clone(), host.clone());
+    ui.show().map_err(|e| e.to_string())?;
+    Ok(SettingsWindowHandle { ui })
+}
+
+/// 重新注入显示器列表与热键（settings/monitors 更新时调用）。
+pub fn refresh_settings_view(handle: &SettingsWindowHandle, settings: &Value, monitors: &Value) {
+    let ui = &handle.ui;
+    ui.set_monitors(settings_view::model(
+        settings_view::build_monitor_entries(monitors, settings),
+    ));
+    ui.set_hotkeys(settings_view::model(settings_view::build_hotkeys(settings)));
+    let page = ui.get_active_page().to_string();
+    ui.set_items(settings_view::model(settings_view::build_items(
+        page.as_str(),
+        settings,
+    )));
+    window_state::apply_settings_theme(ui, settings);
+}
+
+/// 接线全部设置窗口回调。
+fn wire_callbacks(
+    ui: &crate::SettingsWindow,
+    settings: Arc<Mutex<Value>>,
+    host: Arc<crate::monitor_host::MonitorHost>,
+) {
+    // 页面切换 -> 重建该页 items（equiv activePage setState + 渲染分支）
+    let weak = ui.as_weak();
+    let snap = settings.clone();
+    ui.on_page_changed(move |page| {
+        let Some(ui) = weak.upgrade() else { return };
+        let current = snap.lock().map(|g| g.clone()).unwrap_or(json!({}));
+        ui.set_active_page(page.clone());
+        ui.set_items(settings_view::model(settings_view::build_items(
+            &page, &current,
+        )));
+    });
+
+    // 开关 -> settings 写回 + 下发 worker（equiv sendSettings -> writeSettings -> processSettings）
+    let weak = ui.as_weak();
+    let snap = settings.clone();
+    let worker = host.clone();
+    ui.on_item_toggle(move |key, value| {
+        let Some(ui) = weak.upgrade() else { return };
+        let key = key.to_string();
+        let updated = update_setting(&snap, &key, json!(value));
+        apply_side_effects(&worker, &key, &updated);
+        let page = ui.get_active_page().to_string();
+        ui.set_items(settings_view::model(settings_view::build_items(
+            &page, &updated,
+        )));
+    });
+
+    // 下拉/数值 -> 写回（数值键按数字存，equiv target.value * 1）
+    let weak = ui.as_weak();
+    let snap = settings.clone();
+    let worker = host.clone();
+    ui.on_item_choice(move |key, value| {
+        let Some(ui) = weak.upgrade() else { return };
+        let key = key.to_string();
+        let parsed: Value = match value.parse::<f64>() {
+            Ok(n) if is_numeric_key(&key) => json!(n as i64),
+            _ => json!(value.to_string()),
+        };
+        let updated = update_setting(&snap, &key, parsed);
+        apply_side_effects(&worker, &key, &updated);
+        let page = ui.get_active_page().to_string();
+        ui.set_items(settings_view::model(settings_view::build_items(
+            &page, &updated,
+        )));
+    });
+
+    // 按钮 -> 对应动作（equiv save-report / reset-settings / get-coordinates / ...）
+    let worker = host.clone();
+    let snap = settings.clone();
+    ui.on_item_button(move |key| {
+        handle_settings_button(&key, &snap, &worker);
+    });
+
+    // 显示器逐台控制（equiv monitors 页的 rename / hide / gamma / SDR / extend minimum / 排序）
+    let snap = settings.clone();
+    ui.on_monitor_renamed(move |key, name| {
+        let mut guard = match snap.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let id = monitor_id_of(&guard, &key);
+        if guard.get("names").is_none() {
+            guard["names"] = json!({});
+        }
+        if let Some(names) = guard.get_mut("names").and_then(|v| v.as_object_mut()) {
+            names.insert(id, json!(name.to_string()));
+        }
+    });
+    let snap = settings.clone();
+    ui.on_monitor_hidden(move |key, value| {
+        set_monitor_flag(&snap, "hideDisplays", &key, value);
+    });
+    let snap = settings.clone();
+    ui.on_monitor_gamma(move |key, value| {
+        set_monitor_flag(&snap, "gammaAsMainSliderDisplays", &key, value);
+    });
+    let snap = settings.clone();
+    ui.on_monitor_sdr(move |key, value| {
+        set_monitor_flag(&snap, "sdrAsMainSliderDisplays", &key, value);
+    });
+    let snap = settings.clone();
+    ui.on_monitor_extend_minimum(move |key, value| {
+        set_monitor_flag(&snap, "extendMinimumDisplays", &key, value);
+    });
+    let snap = settings.clone();
+    ui.on_monitor_breakpoint(move |key, value| {
+        let mut guard = match snap.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if guard.get("extendMinimumBreakpoints").is_none() {
+            guard["extendMinimumBreakpoints"] = json!({});
+        }
+        if let Some(bp) = guard
+            .get_mut("extendMinimumBreakpoints")
+            .and_then(|v| v.as_object_mut())
+        {
+            bp.insert(key.to_string(), json!(value));
+        }
+    });
+    let snap = settings.clone();
+    ui.on_monitor_moved(move |key, delta| {
+        move_monitor(&snap, &key, delta);
+    });
+
+    // 热键（equiv addHotkey / deleteHotkey）
+    let snap = settings.clone();
+    ui.on_hotkey_add(move || {
+        add_hotkey(&snap);
+    });
+    let snap = settings.clone();
+    ui.on_hotkey_remove(move |id| {
+        remove_hotkey(&snap, &id);
+    });
+    ui.on_hotkey_record(move |_id| {
+        // 录制由低级键盘钩子驱动（RegisterHotKey 只做注册，录制需 WH_KEYBOARD_LL）
+    });
+
+    // 窗口控制（equiv windowMinimize / windowToggleMaximize / windowClose）
+    let weak = ui.as_weak();
+    ui.on_window_minimize(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.window().set_minimized(true);
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_window_maximize(move || {
+        if let Some(ui) = weak.upgrade() {
+            let maximized = ui.window().is_maximized();
+            ui.window().set_maximized(!maximized);
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_window_close(move || {
+        if let Some(ui) = weak.upgrade() {
+            let _ = ui.hide();
+        }
+    });
+}
+
+/// 写入单个设置键并返回新快照。
+fn update_setting(settings: &Arc<Mutex<Value>>, key: &str, value: Value) -> Value {
+    let mut guard = match settings.lock() {
+        Ok(g) => g,
+        Err(_) => return json!({}),
+    };
+    if let Some(obj) = guard.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+    guard.clone()
+}
+
+/// processSettings 的 UI 可达副作用（equiv L1240-L1471）：
+/// 影响 worker 的键立即重下发 settings + ddcBrightnessVCPs；影响检测的键触发重扫。
+fn apply_side_effects(host: &Arc<crate::monitor_host::MonitorHost>, key: &str, settings: &Value) {
+    // 全量下发（equiv L1454-L1463：settings 与 ddcBrightnessVCPs 总是跟随）
+    host.send(json!({"type": "settings", "settings": settings}));
+    host.send(json!({
+        "type": "ddcBrightnessVCPs",
+        "ddcBrightnessVCPs": crate::monitor_host::ddc_brightness_vcps(settings),
+    }));
+
+    // 需要重扫的键（equiv L1282-L1397 的 shouldRefreshMonitors 分支）
+    let refresh = matches!(
+        key,
+        "monitorFeatures"
+            | "userDDCBrightnessVCPs"
+            | "disableDDCDisplays"
+            | "useSoftwareBrightnessFallback"
+            | "disableWMI"
+            | "disableWMIC"
+            | "disableWin32"
+            | "disableAppleStudio"
+            | "gammaAsMainSliderDisplays"
+            | "extendMinimumDisplays"
+    );
+    if refresh {
+        host.refresh_monitors(true, true);
+    } else if key == "extendMinimumBreakpoints" {
+        // 只影响滑块映射，读回亮度即可（equiv L1404-L1408）
+        host.refresh_monitors(false, true);
+    }
+}
+
+/// 数值型设置键（equiv 原版的 target.value * 1 语义）。
+fn is_numeric_key(key: &str) -> bool {
+    matches!(
+        key,
+        "updateInterval"
+            | "ddcPowerOffValue"
+            | "hotkeyPercent"
+            | "scrollShortcutAmount"
+            | "scrollFlyoutAmount"
+            | "detectIdleTimeSeconds"
+            | "detectIdleTimeMinutes"
+            | "idleRestoreSeconds"
+            | "wakeRestoreSeconds"
+            | "hardwareRestoreSeconds"
+            | "checkVCPWaitMS"
+            | "udpPortStart"
+            | "adjustmentTimeLatitude"
+            | "adjustmentTimeLongitude"
+            | "sensorPollingInterval"
+    )
+}
+
+/// 显示器键 -> id（names 表按 id 存，equiv monitorNameChange L346-L351）。
+fn monitor_id_of(settings: &Value, key: &str) -> String {
+    settings
+        .get("lastKnownDisplays")
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(key)
+        .to_string()
+}
+
+/// 设置某显示器的布尔开关（按 key 存）。
+fn set_monitor_flag(settings: &Arc<Mutex<Value>>, field: &str, key: &str, value: bool) {
+    let mut guard = match settings.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if guard.get(field).is_none() {
+        guard[field] = json!({});
+    }
+    if let Some(map) = guard.get_mut(field).and_then(|v| v.as_object_mut()) {
+        map.insert(key.to_string(), json!(value));
+    }
+}
+
+/// 显示器排序（equiv onDragEnd L228-L258：order 数组存 id）。
+fn move_monitor(settings: &Arc<Mutex<Value>>, key: &str, delta: i32) {
+    let mut guard = match settings.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let id = monitor_id_of(&guard, key);
+    let mut order: Vec<String> = guard
+        .get("order")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let pos = match order.iter().position(|v| *v == id) {
+        Some(p) => p,
+        None => {
+            order.push(id);
+            guard["order"] = json!(order);
+            return;
+        }
+    };
+    let target = pos as i32 + delta;
+    if target < 0 || target >= order.len() as i32 {
+        return;
+    }
+    order.swap(pos, target as usize);
+    guard["order"] = json!(order);
+}
+
+/// 新增热键（equiv addHotkey：accelerator 空，一条 offset 动作）。
+fn add_hotkey(settings: &Arc<Mutex<Value>>) {
+    let mut guard = match settings.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let mut list = guard
+        .get("hotkeys")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let percent = guard.get("hotkeyPercent").and_then(|v| v.as_i64()).unwrap_or(10);
+    list.push(json!({
+        "accelerator": "",
+        "id": monitor_thread_manager::generate_uuid(),
+        "actions": [{
+            "monitors": {},
+            "target": "brightness",
+            "type": "offset",
+            "values": [0],
+            "value": percent,
+            "allMonitors": true,
+        }]
+    }));
+    guard["hotkeys"] = json!(list);
+}
+
+/// 删除热键（equiv deleteHotkey）。
+fn remove_hotkey(settings: &Arc<Mutex<Value>>, id: &str) {
+    let mut guard = match settings.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let list: Vec<Value> = guard
+        .get("hotkeys")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|h| h.get("id").and_then(|v| v.as_str()) != Some(id))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    guard["hotkeys"] = json!(list);
+}
+
+/// 按钮动作分发（equiv ipcMain.on 表 L3645-L3733）。
+fn handle_settings_button(
+    key: &str,
+    settings: &Arc<Mutex<Value>>,
+    host: &Arc<crate::monitor_host::MonitorHost>,
+) {
+    match key {
+        "open-settings-file" => {
+            if let Ok(path) = std::env::var("TT_SETTINGS_PATH") {
+                let _ = std::process::Command::new("notepad.exe").arg(path).spawn();
+            }
+        }
+        "reset-settings" => {
+            // equiv L2389-L2395：settings = defaultSettings，清 lastKnownDisplays，写 userClosedIntro
+            let mut guard = match settings.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let defaults = monitor_thread_manager::default_settings(
+                guard.get("isDev").and_then(|v| v.as_bool()).unwrap_or(false),
+                guard.get("isWin11").and_then(|v| v.as_bool()).unwrap_or(true),
+                crate::app::APP_VERSION,
+                crate::app::APP_BUILD,
+                None,
+                &monitor_thread_manager::generate_uuid(),
+                &monitor_thread_manager::generate_uuid(),
+            );
+            *guard = defaults;
+            guard["userClosedIntro"] = json!(true);
+            let snapshot = guard.clone();
+            drop(guard);
+            host.send(json!({"type": "settings", "settings": snapshot}));
+            host.refresh_monitors(true, true);
+        }
+        "save-report" => {
+            // equiv L3733-L3740：getReport -> 写报告文件
+            host.send(json!({"type": "getReport"}));
+        }
+        "check-for-updates" => {
+            // 更新检查走 WinHTTP（§1.2 已定方案），由 update 模块处理
+        }
+        "get-coordinates" => {
+            // equiv L5893 getAndApplyUserCoordinates：按 IP 定位后写入经纬度
+        }
+        _ => {}
+    }
+}
+
+/// 设置窗口文案。
+fn apply_texts(ui: &crate::SettingsWindow) {
+    ui.set_t_title(tt_localize::t("SETTINGS_TITLE").into());
+    ui.set_t_monitors_rename(tt_localize::t("SETTINGS_MONITORS_ENTER_NAME").into());
+    ui.set_t_monitors_hide(tt_localize::t("SETTINGS_MONITORS_HIDE_DISPLAYS_TITLE").into());
+    ui.set_t_monitors_gamma(tt_localize::t("SETTINGS_MONITORS_GAMMA_SLIDER_TITLE").into());
+    ui.set_t_monitors_sdr(tt_localize::t("SETTINGS_MONITORS_SDR_SLIDER_TITLE").into());
+    ui.set_t_monitors_extend_minimum(tt_localize::t("SETTINGS_MONITORS_EXTEND_MINIMUM_TITLE").into());
+    ui.set_t_hotkeys_add(tt_localize::t("SETTINGS_HOTKEYS_ADD").into());
+    ui.set_t_hotkeys_remove(tt_localize::t("GENERIC_DELETE").into());
+    ui.set_t_hotkeys_record(tt_localize::t("SETTINGS_HOTKEYS_PRESS_KEYS_HINT").into());
+    ui.set_t_no_hotkeys(tt_localize::t("SETTINGS_HOTKEYS_NONE").into());
+}
+
+/// 便捷入口：用默认 settings 打开（--settings-smoke 用）。
+pub fn run_settings_window(_host: Arc<crate::monitor_host::MonitorHost>) -> Result<(), String> {
+    let settings = Arc::new(Mutex::new(json!({})));
+    let _handle = open_settings_window(settings, _host)?;
+    slint::run_event_loop_until_quit().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_keys_typed() {
+        assert!(is_numeric_key("updateInterval"));
+        assert!(is_numeric_key("ddcPowerOffValue"));
+        assert!(!is_numeric_key("theme"));
+        assert!(!is_numeric_key("language"));
+    }
+
+    #[test]
+    fn move_monitor_reorders_and_clamps() {
+        let settings = Arc::new(Mutex::new(json!({
+            "order": ["a", "b", "c"],
+            "lastKnownDisplays": {
+                "k1": {"id": "a"}, "k2": {"id": "b"}, "k3": {"id": "c"}
+            }
+        })));
+        move_monitor(&settings, "k2", -1);
+        assert_eq!(settings.lock().unwrap()["order"], json!(["b", "a", "c"]));
+        move_monitor(&settings, "b", -1);
+        assert_eq!(settings.lock().unwrap()["order"], json!(["b", "a", "c"]));
+    }
+
+    #[test]
+    fn monitor_flag_set() {
+        let settings = Arc::new(Mutex::new(json!({})));
+        set_monitor_flag(&settings, "hideDisplays", "k1", true);
+        assert_eq!(settings.lock().unwrap()["hideDisplays"]["k1"], json!(true));
+        set_monitor_flag(&settings, "hideDisplays", "k1", false);
+        assert_eq!(settings.lock().unwrap()["hideDisplays"]["k1"], json!(false));
+    }
+
+    #[test]
+    fn hotkey_add_and_remove() {
+        let settings = Arc::new(Mutex::new(json!({"hotkeys": [], "hotkeyPercent": 15})));
+        add_hotkey(&settings);
+        let list = settings.lock().unwrap()["hotkeys"].as_array().unwrap().len();
+        assert_eq!(list, 1);
+        let id = settings.lock().unwrap()["hotkeys"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        remove_hotkey(&settings, &id);
+        assert_eq!(
+            settings.lock().unwrap()["hotkeys"].as_array().unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn update_setting_returns_new_snapshot() {
+        let settings = Arc::new(Mutex::new(json!({"theme": "default"})));
+        let updated = update_setting(&settings, "theme", json!("dark"));
+        assert_eq!(updated["theme"], json!("dark"));
+        assert_eq!(settings.lock().unwrap()["theme"], json!("dark"));
+    }
+}
