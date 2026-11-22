@@ -1,6 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tt-localize",
+    "crates/vcp-codes",
+    "crates/displayconfig",
+    "crates/wmibridge",
+    "crates/ddcci",
+    "crates/twutils",
+    "crates/activewindow",
+    "crates/sensors",
+    "crates/material",
+    "crates/monitor-worker",
+    "crates/monitor-thread-manager",
+    "crates/tray",
+]
+
 [package]
 name = "twinkle-tray-rust"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tt-localize = { path = "crates/tt-localize" }
+vcp-codes = { path = "crates/vcp-codes" }
+monitor-worker = { path = "crates/monitor-worker" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ddcci = { path = "crates/ddcci" }
+slint = { version = "1.19", features = ["backend-winit", "renderer-femtovg"] }
+wmibridge = { path = "crates/wmibridge" }
+
+[build-dependencies]
+slint-build = "1.19"
