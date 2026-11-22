@@ -351,7 +351,7 @@ mod tests {
     fn hdr_displays_smoke() {
         let displays = super::get_displays();
         println!("HDR displays: {}", displays.len());
-        for (path, d) in &displays {
+        for (_path, d) in &displays {
             println!(
                 "  name={} nits={} hdrSupported={} hdrEnabled={} hdrActive={} bits={}",
                 d.name, d.nits, d.hdr_supported, d.hdr_enabled, d.hdr_active, d.bits
