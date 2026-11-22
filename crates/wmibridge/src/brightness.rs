@@ -236,7 +236,7 @@ pub fn set_brightness(brightness: i32) -> bool {
     use windows::Win32::System::Variant::{VARIANT, VT_UI1};
     use windows::Win32::System::Wmi::{
         IWbemClassObject, WBEM_GENERIC_FLAG_TYPE, WBEM_FLAG_FORWARD_ONLY,
-        WBEM_FLAG_RETURN_IMMEDIATELY, CIM_UINT32, CIM_UINT8,
+        WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_INFINITE, CIM_UINT32, CIM_UINT8,
     };
     use windows::core::BSTR;
 
@@ -271,15 +271,17 @@ pub fn set_brightness(brightness: i32) -> bool {
         Err(_) => return false,
     };
 
-    let method_object: Option<IWbemClassObject> = None;
+    // 等价 C++: pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn)
+    // 注意：Next 把对象写入调用方提供的槽位，必须用真实可写数组接收，
+    // 否则拿到的永远是 None（曾因此导致 setBrightness 恒失败）。
+    let mut objects: [Option<IWbemClassObject>; 1] = [None];
     let mut returned: u32 = 0;
-    let hr = unsafe { enumerator.Next(500, &mut [None], &mut returned) };
+    let hr = unsafe { enumerator.Next(WBEM_INFINITE, &mut objects, &mut returned) };
     if hr.is_err() || returned == 0 {
         return false;
     }
-    let method_object = match method_object {
-        Some(o) => o,
-        None => return false,
+    let Some(method_object) = objects[0].take() else {
+        return false;
     };
 
     let mut method_class: Option<IWbemClassObject> = None;

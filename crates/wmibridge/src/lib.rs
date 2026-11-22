@@ -145,6 +145,33 @@ mod tests {
     }
 
     /// 真机测试: getMonitors。
+    /// 真机闭环：读 -> 设 -> 读回（等价原版 setBrightness 的行为验证）。
+    #[test]
+    fn wmi_brightness_set_roundtrip() {
+        let before = crate::brightness::get_brightness();
+        if before.failed || before.brightness.is_none() {
+            println!("WMI 亮度不可用，跳过");
+            return;
+        }
+        let original = before.brightness.unwrap();
+        println!("before -> {}", original);
+        let target = if original > 50 { 40 } else { 60 };
+        let ok = crate::brightness::set_brightness(target);
+        println!("set_brightness({}) -> {}", target, ok);
+        if !ok {
+            // 部分设备拒绝写入（原版同样静默降级），不视为失败
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let after = crate::brightness::get_brightness();
+        println!("after -> {:?}", after.brightness);
+        if let Some(value) = after.brightness {
+            assert!((value - target).abs() <= 2, "读回应接近 {}，实际 {}", target, value);
+        }
+        // 恢复原值
+        crate::brightness::set_brightness(original);
+    }
+
     #[test]
     fn wmi_monitors_smoke() {
         let result = crate::monitors::get_monitors();
@@ -169,7 +196,7 @@ mod tests {
         let sec = initialize_wmi_security();
         println!("[2] initialize_wmi_security = {}", sec);
 
-        use windows::core::{GUID, Interface};
+        use windows::core::GUID;
         use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
         const CLSID_WBEM_LOCATOR: GUID = GUID::from_u128(0x4590f811_1d3a_11d0_891f_00aa004b2e24);
         let locator: Result<windows::Win32::System::Wmi::IWbemLocator, _> =
