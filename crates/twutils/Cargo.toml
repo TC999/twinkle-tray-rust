@@ -1,0 +1,26 @@
+[package]
+name = "twutils"
+version = "0.1.0"
+edition = "2021"
+
+# windows-future: windows 0.62 的强制传递依赖（非可选），此处仅为引用 IAsyncOperation/AsyncStatus
+# 类型路径（等价 C++ winrt 的 IAsyncOperation）。依赖树无净增（AGENTS.md §1.1 论证）。
+[dependencies]
+windows-future = "0.3"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "ApplicationModel",
+    "Media",
+    "Media_Control",
+    "Media_Playback",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_System_Power",
+    "Win32_System_SystemServices",
+    "Win32_UI_ColorSystem",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
