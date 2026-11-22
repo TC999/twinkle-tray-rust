@@ -76,14 +76,85 @@
   + RegisterHotKeyW 手写 FFI（windows crate 未绑定，AGENTS.md §1.1 论证）+ WM_HOTKEY 解析单测
 - 图标资产直接加载 origin/src/assets/tray-icons/{dark,light}/*.ico（§1.2 禁止自绘）
 
+## Slint UI 实质化 ✅（Round 5 · 2026-11-22）
+
+四个窗口从占位骨架重写为真实可交互 UI（数据驱动 + 全部回调接线），并完成真机渲染与行为对拍。
+
+### 结构
+
+| 文件 | 对应源 | 内容 |
+|---|---|---|
+| ui/theme.slint | css/vars.scss + page.scss | 设计令牌全局（亮/暗 × Win10/Win11、accent、字体度量） |
+| ui/panel.slint | BrightnessPanel.jsx + panel.scss + Slider.jsx + DDCCISliders.jsx + HDRSliders.jsx | 亮度面板：显示器列表 / 联动滑块 / 扩展特征行 / 电源 / 更新条 |
+| ui/settings.slint | SettingsWindow.jsx + SettingsOption.jsx + Titlebar.jsx | 设置窗口：标题栏 + 7 页导航 + 数据驱动设置项 + 显示器逐台控制 + 热键列表 |
+| ui/intro.slint | IntroWindow.jsx + intro.scss | 首次运行引导（含任务栏位置示意） |
+| ui/hud.slint | hotkeyOverlay 系列 | 热键亮度 HUD 浮层 |
+
+### 接线层（Rust）
+
+| 文件 | 对应源 | 内容 |
+|---|---|---|
+| src/monitor_view.rs | BrightnessPanel 渲染分支 + monitor.util.js + volume-utils.js | 显示器 JSON → UI 模型；isAdjustableDisplay / usesGammaSlider / useFeatures / showPowerButton / isHDROnlySDR 逐分支移植；normalizeBrightness + getCalibratedValue 逐行移植 |
+| src/panel_controller.rs | BrightnessPanel 状态机 + IPC 表 + L3027-L3100 节流 + L3138-L3350 updateBrightness | 事件循环 Timer 拉取 worker 事件；VCP 目标判定（SDR/gamma 主滑块）；扩展下限断点；节流器；托盘事件；intro/HUD 窗口 |
+| src/settings_view.rs | SettingsWindow 7 页 + SettingsOption | settings.json → SettingsItem/SettingsPage/SettingsMonitorEntry/SettingsHotkey 数据构建 |
+| src/settings_host.rs | settings.js + createSettings + send-settings + writeSettings/processSettings | 窗口回调 → settings 写回 → worker 下发 + 重扫判定 |
+| src/window_state.rs | tryVibrancy / updateSettingsWindowMaterial / vars.scss | 主题令牌、注册表深色检测、窗口材质（Mica/亚克力） |
+| src/hotkey_host.rs | globalShortcut + applyHotkeys + cleanUpKeyboardKeys | accelerator → (modifiers, vk) 解析、热键动作表 |
+| crates/tray | electron Tray + setTrayMenu | 专用线程托盘 + TrackPopupMenu 右键菜单 + 点击事件 channel |
+
+### 真机对拍（2026-11-22）
+
+**1) UI 冒烟（--ui-smoke）** — 四窗口创建 + 模型注入 + 本地化
+
+```
+panel window: created / panel monitors: 1 visible: 1
+  name=Display 1 type=Wmi level=60 extended=false features=0 power=false
+theme dark=true win11=true / panel title: 调整亮度
+settings pages: 7 (general 23 / monitors 8 / features 6 / time 13 / hotkeys 9 / light-sensor 4 / updates 5)
+settings monitor entries: 1 -> connection=WMI hdr=不支持
+intro title: 欢迎使用 Twinkle Tray！ / hud label: 亮度
+```
+
+**2) 渲染实景** — target/ui-demo.png（面板扩展布局：亮度/对比度/输入源/音量/电源）与
+target/ui-shot2.png（intro 窗口）。中文文案、7 页导航、开关、下拉均正确渲染。
+
+**3) 亮度闭环 + 节流（--brightness-smoke=30）**
+
+```
+original: 60 -> first target: 30 -> throttled expected: 50 -> readback: 50 -> MATCH
+```
+
+连发 30/40/50，只有最后值落地（等价 updateBrightnessThrottle 的「只保留最新值」语义）。
+
+### 本轮修复的真机缺陷
+
+1. **wmibridge set_brightness 恒失败**：enumerator.Next(500, &mut [None], &mut returned) 把结果写进临时数组，
+   method_object 永远是 None，函数必然返回 false。改为真实可写槽位 + WBEM_INFINITE。
+   真机验证：读 60 -> 设 40 -> 读回 40。
+2. **WMI 显示器亮度下发带 id**：原版 type=="wmi" 时不带 id（worker 走全局 WMI 分支），
+   带 id 会落到 DDC 分支写不存在的 VCP。已按 monitor.type 分流。
+3. **面板启动即显示**：原版面板由托盘左键触发，启动时不可见。改为默认隐藏 + 托盘事件切换。
+4. **Slint 语法踩坑**：属性绑定用冒号非等号冒号；if cond 冒号 Element 分支语法；FlowLayout 在 1.19 更名
+   FlexboxLayout；LineEdit 需从 std-widgets 导入；Window 无 key-pressed（需 FocusScope）；
+   return accept 需写全 EventResult.accept；函数内不能用 for-in 语句（改用 Rust 侧计算）。
+
+### 验证入口
+
+```powershell
+.\target\debug\twinkle-tray-rust.exe --ui-smoke --console          # 四窗口 + 模型 + 本地化自检
+.\target\debug\twinkle-tray-rust.exe --ui-demo --console           # 面板/设置实景渲染（截图对拍）
+.\target\debug\twinkle-tray-rust.exe --brightness-smoke=30 --console  # 亮度闭环 + 节流
+cargo test --workspace                                             # 90 个测试用例
+```
+
 ## 未完成（按 AGENTS.md §4 映射）
 
 - [x] ~~`activewindow`~~（SetWinEventHook + 进程/包信息，AppxManifest 解析降级为 package family name，已记录论证）
 - [x] ~~`sensors`~~（COM Sensor API，环境光；CLSID_SensorManager={77A1C827-FCD2-4689-8915-9D613CC5FA3E} 已核实）
 - [x] ~~`material`~~（acrylic.cc SetWindowCompositionAttribute + DWM 属性齐备）
 - [x] ~~Monitors worker~~（`--monitor-worker` 子命令 + DDC 哨兵 + 降级链 + IPC 行协议，全量消息分发）
-- [ ] 主程序（settings 84 项 ✅ / 托盘 / 热键 / 命令队列节流 ✅ / 事件源开关）——启动序列与 worker 宿主已完成，托盘与热键运行时接线待做
-- [ ] Slint UI（panel / settings / intro / hud 四窗口）
+- [ ] 主程序（settings 84 项 ✅ / 托盘 ✅ 运行时接线 / 热键解析 ✅ 注册待接 / 命令队列节流 ✅ / 事件源开关）
+- [x] ~~Slint UI（panel / settings / intro / hud 四窗口）~~（Round 5 实质化完成，见上）
 - [ ] HDR（并入 displayconfig，DisplayConfigSetDeviceInfo）
 
 ## settings 兼容层 ✅
