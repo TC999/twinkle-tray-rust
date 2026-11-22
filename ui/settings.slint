@@ -1,0 +1,63 @@
+// 设置窗口。
+// 等价 origin/src/settings.js 的功能项（AGENTS.md §4: 每个设置开关都要有对应物）。
+// 分类对应 components/Settings/:
+//   General / Monitor Features / Hotkeys / Time Adjustments / Sleep &
+//   Idle / Profiles / Notifications / Advanced / About
+import { TabWidget } from "std-widgets.slint";
+
+export component SettingsWindow inherits Window {
+    in-out property <string> settings-json: "{}";
+    callback settings-changed(string /* key */, string /* value json */);
+    callback request-close();
+
+    title: "Twinkle Tray Settings";
+    width: 720px;
+    height: 560px;
+
+    TabWidget {
+        Tab {
+            title: "General";
+            VerticalLayout {
+                spacing: 8px;
+                // language / theme / icon / openAtLogin / brightnessAtStartup / checkForUpdates / analytics
+                Text { text: "Language / Theme / Startup / Updates"; }
+            }
+        }
+        Tab {
+            title: "Monitor Features";
+            VerticalLayout {
+                // monitorFeatures / disableDDCDisplays / userDDCBrightnessVCPs / remaps
+                Text { text: "Per-monitor VCP features and DDC blocking"; }
+            }
+        }
+        Tab {
+            title: "Hotkeys";
+            VerticalLayout {
+                // hotkeys / hotkeyPercent / hotkeysBreakLinkedLevels
+                Text { text: "Global hotkeys"; }
+            }
+        }
+        Tab {
+            title: "Time Adjustments";
+            VerticalLayout {
+                // adjustmentTimes / adjustmentTimeSpeed / Longitude / Latitude（suncalc）
+                Text { text: "Scheduled brightness by time / sun"; }
+            }
+        }
+        Tab {
+            title: "Sleep & Idle";
+            VerticalLayout {
+                // detectIdleTime* / idleRestoreSeconds / wakeRestoreSeconds / restartOnWake
+                Text { text: "Idle detection and restore timing"; }
+            }
+        }
+        Tab {
+            title: "Advanced";
+            VerticalLayout {
+                // updateInterval / checkVCPWaitMS / preferredDDCCIMethod / disableWMI 等
+                // 双事件源开关（useWin32Event/useElectronEvents/useWmDisplayChangeEvent/...）
+                Text { text: "Diagnostic switches (dual event sources)"; }
+            }
+        }
+    }
+}

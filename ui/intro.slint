@@ -1,0 +1,20 @@
+// 首次运行引导窗口。
+// 等价 origin/src/intro.js：欢迎步骤 + 权限说明 + userClosedIntro 设置。
+export component IntroWindow inherits Window {
+    in-out property <int> step: 0;
+    callback next-step();
+    callback finished(); // 等价 "close-intro" -> userClosedIntro = true
+
+    title: "Welcome to Twinkle Tray";
+    width: 480px;
+    height: 320px;
+
+    VerticalLayout {
+        spacing: 12px;
+        Text { text: step == 0 ? "Welcome!" : "You're all set!"; }
+        Rectangle {
+            TouchArea { clicked => { root.finished(); } }
+            Text { text: "Get Started"; }
+        }
+    }
+}

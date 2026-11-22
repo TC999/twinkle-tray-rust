@@ -1,0 +1,8 @@
+// 单一编译入口（slint-build 的 include_modules! 只含最后一次 compile 的组件；
+// 用一个入口文件聚合四个窗口，等价 parcel 多入口构建语义）
+import { PanelWindow } from "panel.slint";
+import { SettingsWindow } from "settings.slint";
+import { IntroWindow } from "intro.slint";
+import { HudWindow } from "hud.slint";
+
+export { PanelWindow, SettingsWindow, IntroWindow, HudWindow }

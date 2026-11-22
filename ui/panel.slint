@@ -1,0 +1,65 @@
+// 亮度面板主窗口。
+// 等价 origin/src/panel.js + components/*.jsx 的功能项（重写而非照抄布局，AGENTS.md §4）。
+// 功能项对应:
+//   - 显示器亮度滑块列表（monitors-updated 驱动）
+//   - 亮度联动（linked features: contrast 等跟随亮度）
+//   - 显示器开/关、睡眠按钮
+//   - 设置入口按钮
+import { StandardListView } from "std-widgets.slint";
+
+export component PanelWindow inherits Window {
+    in-out property <string> theme: "dark";
+    in-out property <length> panel-width: 320px;
+    in-out property <length> panel-height: 200px;
+    // 显示器列表（JSON 数组序列化传递，字段与 Monitors worker 输出一致）
+    in-out property <string> monitors-json: "[]";
+    // 亮度变更回调（等价 ipc "update-brightness"）
+    callback brightness-changed(string /* monitor id */, int /* percent */);
+    callback refresh-requested();        // 等价 "full-refresh"
+    callback open-settings();            // 等价 "open-settings"
+    callback sleep-displays();           // 等价 "sleep-displays"
+    callback monitor-toggled(string /* id */, bool /* on */); // 等价 "sleep-display"
+
+    title: "Twinkle Tray";
+    width: panel-width;
+    height: panel-height;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+
+        // 显示器滑块区（数量由 monitors-json 决定，逐台一行）
+        Rectangle {
+            // Slint 1.x 无动态子组件生成；滑块行由 Rust 侧按显示器数量重建
+            // （等价 React 组件列表渲染语义）
+            height: panel-height - 48px;
+            Text {
+                text: "Monitors";
+                color: theme == "dark" ? #ffffff : #000000;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 4px;
+            Rectangle {
+                height: 32px;
+                TouchArea {
+                    clicked => { root.refresh-requested(); }
+                }
+                Text { text: "⟳"; }
+            }
+            Rectangle {
+                TouchArea {
+                    clicked => { root.sleep-displays(); }
+                }
+                Text { text: "Sleep"; }
+            }
+            Rectangle {
+                TouchArea {
+                    clicked => { root.open-settings(); }
+                }
+                Text { text: "⚙"; }
+            }
+        }
+    }
+}

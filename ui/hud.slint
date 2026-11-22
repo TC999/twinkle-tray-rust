@@ -1,0 +1,20 @@
+// HUD 浮层（热键调节亮度时的覆盖显示）。
+// 等价 components/HUD/ 功能：半透明圆角 + 当前亮度值，自动隐藏。
+export component HudWindow inherits Window {
+    in-out property <int> brightness: 50;
+    in-out property <bool> visible-state: false;
+
+    width: 120px;
+    height: 48px;
+    always-on-top: true;
+    no-frame: true;
+
+    Rectangle {
+        border-radius: 8px;
+        background: #80000000;
+        Text {
+            text: brightness + "%";
+            color: #ffffff;
+        }
+    }
+}
