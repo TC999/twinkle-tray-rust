@@ -1,0 +1,18 @@
+[package]
+name = "monitor-worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tt-localize = { path = "../tt-localize" }
+vcp-codes = { path = "../vcp-codes" }
+ddcci = { path = "../ddcci" }
+wmibridge = { path = "../wmibridge" }
+displayconfig = { path = "../displayconfig" }
+twutils = { path = "../twutils" }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
