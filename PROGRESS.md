@@ -147,15 +147,62 @@ original: 60 -> first target: 30 -> throttled expected: 50 -> readback: 50 -> MA
 cargo test --workspace                                             # 90 个测试用例
 ```
 
+## 主程序运行时完整化 ✅（Round 6 · 2026-11-23）
+
+新增/重写模块（全部逐段对照 electron.js）：
+
+| 文件 | 覆盖源 | 要点 |
+|---|---|---|
+| `crates/suncalc` | suncalc v1.9.0（~200 行纯数学） | 逐函数等价移植 getTimes 全链（toJulian/solarMeanAnomaly/eclipticLongitude/julianCycle/solarTransitJ/hourAngle）；**月亮与方位角函数未移植（本仓库调用链从未使用，已记录论证）**；node 基线逐值对拍（北京/纽约双坐标 sunrise/sunset/dawn/dusk 等全键一致） |
+| `src/runtime_hosts.rs` | electron.js L1629-L1798（known displays/applyProfile/setKnownBrightness/shouldSkipDisplay）、L3053-L3100（节流）、L3138-L3300（updateBrightness 主进程决策）、L3353-L3495（updateAllBrightness/transition）、L5625-L5856（TOD 全链）、L5485-L5622（idle 检测） | RuntimeHost 状态机（tempSettings/lastKnownDisplays/isUserIdle/recentlyWokeUp/hotkeyThrottle/cycleIndexes）；TOD 含 sunCalc 时间名 + parseTime + LERP 动画计划；idle dim 联动 **全屏检测与媒体播放为「与」条件（§3.2 高危区，未删分支）** |
+| `src/system_events.rs` | L5210-L5226（addEventListeners）、L3901-L3977（电源广播）、L5250-L5436（monitor/metrics change）、L649-L664（原生亮度键）、L1801-L1831（applyHotkeys） | 事件源开关逐字保留（useWin32Event/useWmDisplayChangeEvent/useGuidPresenceEvent/useGuidBrightnessEvent/useScMonitorPowerEvent/disablePowerNotifications）；GetTimeZoneInformation 等价 getTimezoneOffset（含 DST bias）；GetLastInputInfo 等价 getSystemIdleTime |
+| `src/hotkey_host.rs`（扩展） | doHotkey L1837-L2014 | 全动作类型（off/refresh/set/offset/cycle）；cycle 索引的恒真分支逐字保留；skipInternalBrightnessOffset 分支保留；powerState→0xD2 映射逐字对照 |
+| `crates/tray`（扩展） | tray.on("click")/hookWindowMessage 系列 | 消息窗口承载 WM_HOTKEY/WM_DISPLAYCHANGE(126)/WM_POWERBROADCAST(0x218)/WM_SYSCOMMAND SC_MONITORPOWER/WM_INPUT 原生亮度键；TrayEvent 枚举扩展 6 类；菜单项支持 checkbox（MF_CHECKED）与分隔线（MF_SEPARATOR）；tray_window_handle() 供主线程注册热键 |
+| `src/panel_controller.rs`（扩展） | setTrayMenu click 回调 + run_panel_controller | 托盘菜单 id 全量路由（1001-1003/2000 quit/2001-2002 暂停 checkbox/2003 刷新/2100+ profiles/2004-2006 DEBUG）；SystemEvents 主线程槽位（RefCell 等价单线程事件循环语义）；HUD 请求消费 |
+| `src/main.rs`（重接线） | 启动序列 | RuntimeHost + SystemEvents 装配；start_hotkeys 经托盘窗口句柄 RegisterHotKeyW（MOD_* + MOD_NOREPEAT）；settings 路径快照供菜单构建 |
+
+### 关键实现记录（Round 6）
+
+13. **suncalc 移植范围**：getPosition/moon* 未移植——`getSunCalcTime/getSunCalcTimes`（electron.js:L5733-L5747）只调用 getTimes；按 §1.1 最小化原则裁剪，记录于 crate 文档。
+14. **pauseMonitorUpdates 语义**：原版（L3008-L3011）是主进程本地的 `updateInterval*2` 到期标志，不是 worker 消息；以 `paused_until: Mutex<Option<Instant>>` 等价实现，tick 到期复位。
+15. **托盘事件路由**：TrayEvent channel 是 mpsc 单发，托盘线程→UI 唯一接收端；系统类事件（Hotkey/PowerSetting/...）由 UI 层 handle_tray_event 转发进 `FORWARDED_EVENTS` 全局队列，SystemEvents::tick 消费——避免双读。
+16. **GetPowerSetting 返回序**：twutils 返回 `(guid, name, data)`，tray 转发层按 `(name, guid, data)` 重排后与 electron.js 分支对齐。
+17. **'static 节流单例**：doHotkey 与 UI tick 共用 `SHARED_THROTTLE: OnceLock<Mutex<BrightnessThrottle>>`（等价原版 updateBrightnessThrottle 模块级 Map 单例）；HotkeyContext 持 `&'static Mutex<_>`。
+18. **profiles 子菜单降级**：tray 菜单暂无 HMENU 子菜单层级，profiles 平铺为 2100+ id 项（点击应用行为等价，视觉少一层缩进）；升级路径记录在案。
+
+### 真机对拍（2026-11-23）
+
+```
+# suncalc node 基线（2026-11-23T04:00Z, 北京 39.9042/116.4074, UTC+8）
+# dawn 6:26 / sunrise 6:55 / solarNoon 11:59 / goldenHour 16:24 /
+# sunsetStart 17:1 / sunset 17:4 / dusk 17:32 / night 18:36  → Rust 逐值一致
+cargo test -p suncalc          # 3 passed
+
+# 启动序列（接入 RuntimeHost/SystemEvents 后回归）
+--app-smoke → settings keys: 99 / worker ready: true / monitor count: 1 / CMN1521 brightness=60
+--ui-smoke  → 四窗口 + 7 页模型 + 本地化全部一致（无回归）
+--brightness-smoke=30 → original 60 → throttled 50 → readback 50 → MATCH（60→50→60 闭环）
+
+# 质量状态
+cargo build --workspace: 零错误零警告
+cargo test --workspace: 96 个测试用例全部通过（12 crate + suncalc 新增 3）
+```
+
 ## 未完成（按 AGENTS.md §4 映射）
 
 - [x] ~~`activewindow`~~（SetWinEventHook + 进程/包信息，AppxManifest 解析降级为 package family name，已记录论证）
 - [x] ~~`sensors`~~（COM Sensor API，环境光；CLSID_SensorManager={77A1C827-FCD2-4689-8915-9D613CC5FA3E} 已核实）
 - [x] ~~`material`~~（acrylic.cc SetWindowCompositionAttribute + DWM 属性齐备）
 - [x] ~~Monitors worker~~（`--monitor-worker` 子命令 + DDC 哨兵 + 降级链 + IPC 行协议，全量消息分发）
-- [ ] 主程序（settings 84 项 ✅ / 托盘 ✅ 运行时接线 / 热键解析 ✅ 注册待接 / 命令队列节流 ✅ / 事件源开关）
+- [x] ~~主程序~~（Round 6：托盘运行时接线 ✅ / 热键注册+doHotkey ✅ / 命令队列节流 ✅ / 事件源开关 ✅ / TOD+idle 联动 ✅ / known displays ✅）
 - [x] ~~Slint UI（panel / settings / intro / hud 四窗口）~~（Round 5 实质化完成，见上）
-- [ ] HDR（并入 displayconfig，DisplayConfigSetDeviceInfo）
+- [x] ~~HDR~~（并入 displayconfig，Round 4 完成；DisplayConfigSetDeviceInfo 真机 nits=80 对拍通过）
+
+### 剩余可深化项（不影响 §4 映射完整性）
+
+- [ ] 托盘 HMENU 子菜单层级（profiles 视觉层级；当前平铺等价）
+- [ ] 原生亮度键长按重复（NATIVE_BRIGHTNESS_KEY_REPEAT_INTERVAL=120ms；当前单发等价）
+- [ ] GA4 埋点/更新检查的网络路径（WinHTTP 等价移植，§1.2）
 
 ## settings 兼容层 ✅
 

@@ -169,6 +169,8 @@ pub struct PanelController {
     events: Receiver<Value>,
     /// 托盘事件（左键 -> 切换面板；右键菜单项 -> 动作）
     pub tray_events: Option<Receiver<tray::TrayEvent>>,
+    /// 运行时状态机（完整模式注入;smoke 模式为 None）
+    pub runtime: Option<Arc<crate::runtime_hosts::RuntimeHost>>,
 }
 
 impl PanelController {
@@ -184,7 +186,18 @@ impl PanelController {
             settings,
             events: rx,
             tray_events: None,
+            runtime: None,
         }
+    }
+
+    /// 注入运行时状态机(完整模式)。
+    pub fn attach_runtime(&mut self, runtime: Arc<crate::runtime_hosts::RuntimeHost>) {
+        self.runtime = Some(runtime);
+    }
+
+    /// 读取运行时状态机。
+    pub fn runtime(&self) -> Option<Arc<crate::runtime_hosts::RuntimeHost>> {
+        self.runtime.clone()
     }
 
     /// 接入托盘事件源（由 main 在创建托盘后调用）。
@@ -210,6 +223,146 @@ impl PanelController {
             out.push(ev);
         }
         out
+    }
+}
+
+/// 带运行时状态机的完整版（equiv 原版主进程全量事件源接入）。
+/// tick 额外驱动 system_events（热键/电源/idle/TOD/显示变化）与 transition。
+pub fn run_panel_controller_with_runtime(
+    host: Arc<MonitorHost>,
+    settings: Arc<Mutex<Value>>,
+    tray_events: Option<Receiver<tray::TrayEvent>>,
+    runtime: Arc<crate::runtime_hosts::RuntimeHost>,
+    system: crate::system_events::SystemEvents,
+) -> Result<(), String> {
+    // transition 排程联动:runtime_hosts::transition_brightness 之后由 schedule_transition_next 排程
+    // (SystemEvents::tick 内轮询 TRANSITION_DUE_AT)
+    // SystemEvents 安装到主线程槽位(Slint 组件/Timer 与其同线程)
+    SYSTEM_EVENTS_SLOT.with(|slot| {
+        slot.borrow_mut().replace(system);
+    });
+    run_panel_controller_inner(host, settings, tray_events, runtime)
+}
+
+/// 内部实现(共享 run_panel_controller 的接线逻辑;SystemEvents 从主线程槽位读取)。
+fn run_panel_controller_inner(
+    host: Arc<MonitorHost>,
+    settings: Arc<Mutex<Value>>,
+    tray_events: Option<Receiver<tray::TrayEvent>>,
+    runtime: Arc<crate::runtime_hosts::RuntimeHost>,
+) -> Result<(), String> {
+    let panel = crate::PanelWindow::new().map_err(|e| e.to_string())?;
+    let weak = panel.as_weak();
+
+    let initial_settings = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
+    let state = Rc::new(RefCell::new(PanelState {
+        settings: initial_settings.clone(),
+        ..Default::default()
+    }));
+    let throttle = Rc::new(RefCell::new(BrightnessThrottle::new()));
+    let mut controller = PanelController::new(host.clone(), settings.clone());
+    controller.attach_runtime(runtime.clone());
+    if let Some(rx) = tray_events {
+        controller.attach_tray(rx);
+    }
+    let controller = Rc::new(controller);
+
+    window_state::apply_theme(&panel, &initial_settings);
+    apply_static_texts(&panel);
+    panel.set_scroll_amount(
+        initial_settings
+            .get("scrollFlyoutAmount")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(2.0) as f32,
+    );
+    panel.set_show_sleep(
+        initial_settings
+            .get("sleepAction")
+            .and_then(|v| v.as_str())
+            .map(|v| v != "none")
+            .unwrap_or(true),
+    );
+
+    wire_callbacks(&panel, &state, &throttle, &controller, &host, &settings);
+
+    // 首次运行引导
+    let user_closed_intro = initial_settings
+        .get("userClosedIntro")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !user_closed_intro {
+        show_intro(settings.clone());
+    }
+
+    // 面板默认隐藏（equiv 原版：面板由托盘左键触发 toggleTray 才显示）
+    {
+        let mut st = state.borrow_mut();
+        st.visible = false;
+    }
+
+    // 初始请求
+    host.refresh_monitors(true, true);
+
+    // ---- 事件循环定时器:系统事件层 + worker 事件 + 节流冲刷 ----
+    let tick_state = state.clone();
+    let tick_throttle = throttle.clone();
+    let tick_controller = controller.clone();
+    let tick_weak = weak.clone();
+    let tick_runtime = runtime.clone();
+    let tick_throttle_shared: &'static Mutex<BrightnessThrottle> = crate::system_events::shared_throttle();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, Duration::from_millis(50), move || {
+        let Some(ui) = tick_weak.upgrade() else { return };
+        // 0a) 系统事件层(热键/电源/idle/TOD/显示变化/过渡)
+        crate::system_events::transition_due_check();
+        system_tick(&tick_runtime, &tick_throttle_shared);
+        // 0b) HUD 请求(hotkey overlay)
+        if crate::system_events::take_hud_request() {
+            crate::panel_controller::show_hud_from_runtime(&tick_runtime);
+        }
+        tick(&ui, &tick_state, &tick_throttle, &tick_controller);
+    });
+
+    let result = slint::run_event_loop_until_quit().map_err(|e| e.to_string());
+    timer.stop();
+    result
+}
+
+/// system_events 的单次 tick(UI 主线程调用;SystemEvents 不是 Send,放在闭包捕获中)。
+fn system_tick(rt: &Arc<crate::runtime_hosts::RuntimeHost>, _throttle: &'static Mutex<BrightnessThrottle>) {
+    // SystemEvents 保存在主线程槽位(RefCell 语义等价原版单线程事件循环)
+    SYSTEM_EVENTS_SLOT.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if let Some(system) = borrow.as_mut() {
+            system.tick(rt);
+        }
+    });
+}
+
+thread_local! {
+    /// SystemEvents 主线程槽位(由 run_panel_controller_with_runtime 安装)。
+    static SYSTEM_EVENTS_SLOT: std::cell::RefCell<Option<crate::system_events::SystemEvents>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// HUD 快照展示(取当前平均亮度,等价 hotkeyOverlayStart 的覆盖层)。
+pub fn show_hud_from_runtime(rt: &Arc<crate::runtime_hosts::RuntimeHost>) {
+    let settings = rt.settings_snapshot();
+    let monitors = rt.host.monitors_snapshot();
+    let mut avg = 0.0;
+    let mut n = 0u32;
+    if let Some(obj) = monitors.as_object() {
+        for (_k, m) in obj {
+            let mtype = m.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if mtype == "ddcci" || mtype == "wmi" || mtype == "software" || monitor_view::uses_gamma_slider(m, &settings) {
+                n += 1;
+                avg += m.get("brightness").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            }
+        }
+    }
+    if n > 0 {
+        let label = tt_localize::t("PANEL_LABEL_BRIGHTNESS");
+        show_hud((avg / n as f64) as f32, &label);
     }
 }
 
@@ -883,8 +1036,55 @@ fn handle_tray_event(
             1003 => {
                 sleep_displays(state);
             }
+            // 2000：退出（equiv quitApp L4730-L4732）
+            2000 => {
+                let _ = ui.window().hide();
+                let _ = slint::quit_event_loop();
+            }
+            // 2001：暂停 TOD（equiv L4653 的 tempSettings.pauseTimeAdjustments）
+            2001 => {
+                let rt = controller.runtime();
+                if let Some(rt) = rt {
+                    let mut temp = rt.temp.lock().unwrap();
+                    temp.pause_time_adjustments = !temp.pause_time_adjustments;
+                }
+            }
+            // 2002：暂停 idle 检测（equiv L4660 的 tempSettings.pauseIdleDetection）
+            2002 => {
+                let rt = controller.runtime();
+                if let Some(rt) = rt {
+                    let mut temp = rt.temp.lock().unwrap();
+                    temp.pause_idle_detection = !temp.pause_idle_detection;
+                }
+            }
+            // 2003：刷新显示器（equiv L4635）
+            2003 => {
+                ui.invoke_refresh_requested();
+                controller.host.refresh_monitors(true, true);
+            }
+            // 2100+：应用 profile（equiv applyProfileBrightness;亮度档案的 setBrightness 应用）
+            id if id >= 2100 => {
+                let rt = controller.runtime();
+                if let Some(rt) = rt {
+                    let settings = rt.settings_snapshot();
+                    let profiles = settings.get("profiles").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let idx = (id - 2100) as usize;
+                    if let Some(profile) = profiles.get(idx) {
+                        // applyProfileBrightness:profile 的 monitors/brightness 应用(等价 applyProfile)
+                        let brightness = profile.get("brightness").and_then(|v| v.as_f64());
+                        if let Some(level) = brightness {
+                            crate::runtime_hosts::update_all_brightness(&rt, level, "set");
+                        }
+                    }
+                }
+            }
             _ => {}
         },
+        // 系统事件(热键/电源/显示变化)转发给 system_events 层
+        tray::TrayEvent::Hotkey(_) | tray::TrayEvent::WmDisplayChange | tray::TrayEvent::PowerSetting(_, _, _)
+        | tray::TrayEvent::PowerBroadcast(_) | tray::TrayEvent::ScMonitorPower | tray::TrayEvent::NativeBrightnessKey(_) => {
+            crate::system_events::forward_event(event.clone());
+        }
     }
 }
 

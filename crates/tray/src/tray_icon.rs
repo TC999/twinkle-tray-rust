@@ -9,6 +9,7 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use crate::hotkey::WM_HOTKEY;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS, NIF_ICON, NIF_MESSAGE, NIF_TIP,
@@ -39,6 +40,10 @@ pub struct TrayMenuItem {
     pub id: u32,
     pub label: String,
     pub enabled: bool,
+    /// checkbox 选中态（equiv type: 'checkbox' 的 checked；None = normal 项）
+    pub checked: Option<bool>,
+    /// 分隔线（label 无效）
+    pub separator: bool,
 }
 
 /// 托盘事件（主线程消费）。
@@ -50,6 +55,19 @@ pub enum TrayEvent {
     RightClick,
     /// 菜单项选中
     Menu(u32),
+    /// WM_HOTKEY（wparam = 注册 id；equiv globalShortcut 回调）
+    Hotkey(i32),
+    /// WM_DISPLAYCHANGE（equiv hookWindowMessage(126)）
+    WmDisplayChange,
+    /// WM_POWERBROADCAST + PBT_POWERSETTINGCHANGE 的设置三元组
+    /// (guid_name, guid_string, data)；空名时以 guid_string 区分。
+    PowerSetting(String, String, u32),
+    /// WM_POWERBROADCAST 其它事件(wParam)
+    PowerBroadcast(u32),
+    /// WM_SYSCOMMAND SC_MONITORPOWER(lParam == 2)
+    ScMonitorPower,
+    /// WM_INPUT 原生亮度键报告（"BrightnessUp"/"BrightnessDown"/""）
+    NativeBrightnessKey(String),
 }
 
 /// 托盘图标句柄（含消息窗口）。
@@ -148,6 +166,10 @@ pub fn create_tray_icon(config: &TrayConfig) -> Option<TrayIconHandle> {
             *menu = config.menu_items.clone();
         }
 
+        if let Ok(mut slot) = TRAY_HWND.lock() {
+            *slot = Some(hwnd.0 as usize);
+        }
+
         let ok = Shell_NotifyIconW(NOTIFY_ICON_MESSAGE(NIM_ADD.0), &nid);
         if ok.as_bool() {
             Some(TrayIconHandle { hwnd, uid: 1 })
@@ -195,13 +217,24 @@ unsafe fn show_menu(hwnd: HWND) {
     let items = menu_slot().lock().map(|g| g.clone()).unwrap_or_default();
     let Ok(menu) = CreatePopupMenu() else { return };
     for item in &items {
+        if item.separator {
+            // MF_SEPARATOR = 0x800
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x0000_0800), 0, windows::core::PCWSTR::null());
+            continue;
+        }
         let label: Vec<u16> = item.label.encode_utf16().chain(std::iter::once(0)).collect();
         // MF_GRAYED=1, MF_DISABLED=2（未启用项灰显）
-        let flags = if item.enabled {
+        let mut flags = if item.enabled {
             MF_STRING
         } else {
             MF_STRING | MENU_ITEM_FLAGS(0x0000_0003)
         };
+        if let Some(checked) = item.checked {
+            // MF_CHECKED = 0x8（equiv type: 'checkbox'）
+            if checked {
+                flags = flags | MENU_ITEM_FLAGS(0x0000_0008);
+            }
+        }
         let _ = AppendMenuW(menu, flags, item.id as usize, windows::core::PCWSTR::from_raw(label.as_ptr()));
     }
     let mut pt = POINT::default();
@@ -258,7 +291,67 @@ unsafe extern "system" fn tray_wnd_proc(
         // WM_DESTROY
         return LRESULT(0);
     }
-    let _ = wparam;
+    // WM_HOTKEY:热键注册在本窗口上,转发给主线程(equiv globalShortcut 回调)
+    if msg == WM_HOTKEY {
+        if let Ok(cb) = callback_slot().lock() {
+            if let Some(cb) = cb.as_ref() {
+                cb(TrayEvent::Hotkey(wparam.0 as i32));
+            }
+        }
+        return LRESULT(0);
+    }
+    // WM_DISPLAYCHANGE(126):显示变化(equiv hookWindowMessage(126))
+    if msg == 126 {
+        if let Ok(cb) = callback_slot().lock() {
+            if let Some(cb) = cb.as_ref() {
+                cb(TrayEvent::WmDisplayChange);
+            }
+        }
+        return LRESULT(0);
+    }
+    // WM_POWERBROADCAST(0x218)
+    if msg == 0x218 {
+        const PBT_POWERSETTINGCHANGE: u32 = 0x8013; // 32787
+        if wparam.0 as u32 == PBT_POWERSETTINGCHANGE {
+            // LPARAM 指向 POWERBROADCAST_SETTING(twutils::power_events 解析;返回 (guid, name, data))
+            let ptr = lparam.0 as usize;
+            if let Some((guid, name, data)) = twutils::power_events::get_power_setting(ptr) {
+                if let Ok(cb) = callback_slot().lock() {
+                    if let Some(cb) = cb.as_ref() {
+                        cb(TrayEvent::PowerSetting(name, guid, data));
+                    }
+                }
+            }
+        } else {
+            if let Ok(cb) = callback_slot().lock() {
+                if let Some(cb) = cb.as_ref() {
+                    cb(TrayEvent::PowerBroadcast(wparam.0 as u32));
+                }
+            }
+        }
+        return LRESULT(0);
+    }
+    // WM_SYSCOMMAND(0x0112) SC_MONITORPOWER(0xF170) lParam==2
+    if msg == 0x0112 {
+        if wparam.0 as u32 == 61808 && (lparam.0 as u32) == 2 {
+            if let Ok(cb) = callback_slot().lock() {
+                if let Some(cb) = cb.as_ref() {
+                    cb(TrayEvent::ScMonitorPower);
+                }
+            }
+        }
+        return LRESULT(0);
+    }
+    // WM_INPUT(0x00FF):原生亮度键 RAWINPUT(lparam 为 HRAWINPUT)
+    if msg == 0x00FF {
+        let key = twutils::brightness_keys::read_brightness_key(windows::Win32::Foundation::HANDLE(lparam.0 as *mut core::ffi::c_void));
+        if let Ok(cb) = callback_slot().lock() {
+            if let Some(cb) = cb.as_ref() {
+                cb(TrayEvent::NativeBrightnessKey(key));
+            }
+        }
+        return LRESULT(0);
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
@@ -274,6 +367,18 @@ pub fn run_message_loop() {
 
 /// 托盘线程 id（用于退出时 PostThreadMessage(WM_QUIT)）。
 static TRAY_THREAD_ID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
+
+/// 托盘消息窗口句柄（主线程读取以注册热键等；窗口由托盘线程创建）。
+static TRAY_HWND: Mutex<Option<usize>> = Mutex::new(None);
+
+/// 主线程读取托盘窗口句柄（None = 托盘线程尚未创建窗口）。
+pub fn tray_window_handle() -> Option<HWND> {
+    TRAY_HWND
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|p| HWND(p as *mut core::ffi::c_void))
+}
 
 fn thread_id_slot() -> &'static Mutex<Option<u32>> {
     TRAY_THREAD_ID.get_or_init(|| Mutex::new(None))

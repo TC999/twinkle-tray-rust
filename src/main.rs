@@ -141,20 +141,41 @@ fn main() {
 
     let shared_settings = Arc::new(Mutex::new(settings.clone()));
 
-    // 托盘图标（equiv createTray：图标随主题切换，§1.2 禁止自绘）
-    let (tray_handle, tray_events) = start_tray(&settings, &exe_dir);
+    // settings 路径快照(托盘菜单构建读取;等价原版 setTrayMenu 读内存 settings)
+    {
+        let mut slot = SETTINGS_PATH_SNAPSHOT.lock().unwrap();
+        *slot = Some(paths.settings_path.clone());
+    }
 
-    // 全局热键（equiv applyHotkeys）
-    start_hotkeys(&settings);
+    // 托盘图标（equiv createTray：图标随主题切换，§1.2 禁止自绘）
+    let (_tray_handle, tray_events) = start_tray(&settings, &exe_dir);
+
+    // 运行时状态机（equiv electron.js 的模块级状态集合）
+    let runtime = twinkle_tray_rust::runtime_hosts::RuntimeHost::new(
+        host.clone(),
+        shared_settings.clone(),
+        paths.known_displays_path.clone(),
+    );
+
+    // 系统事件层（equiv addEventListeners + applyHotkeys + 定时器集合）
+    let mut system = twinkle_tray_rust::system_events::SystemEvents::new(None);
+    twinkle_tray_rust::system_events::install_display_listener();
+
+    // 全局热键（equiv applyHotkeys）：注册在托盘线程消息窗口上
+    start_hotkeys(&settings, &mut system);
 
     // 主进程 UI（主线程 = Slint 事件循环，AGENTS.md §5）
-    if let Err(e) = twinkle_tray_rust::run_panel(host.clone(), shared_settings, tray_events) {
+    if let Err(e) = twinkle_tray_rust::run_panel(
+        host.clone(),
+        shared_settings.clone(),
+        tray_events,
+        runtime.clone(),
+        system,
+    ) {
         eprintln!("面板启动失败: {}", e);
     }
 
-    if let Some(handle) = tray_handle {
-        tray::remove_tray_icon(&handle);
-    }
+    // 图标/窗口由托盘线程销毁(同线程约束);只投递 WM_QUIT
     tray::stop_tray_thread();
     host.manager.set_quitting(true);
     host.manager.stop();
@@ -242,31 +263,173 @@ fn start_tray(
     (None, Some(events))
 }
 
-/// 托盘右键菜单（equiv electron.js setTrayMenu 的项集合，§1.2 自写 HMENU）。
+/// 托盘右键菜单（equiv electron.js setTrayMenu L4627-L4698 的项集合，§1.2 自写 HMENU）。
 /// 菜单 id 段位：1001+ 对应 electron 模板的 click 回调。
 fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
+    let settings = read_settings_snapshot();
+    // tempSettings 初始为 false(equiv temp_settings() 默认值);菜单勾选态随 checkbox 点击刷新
+    let temp = twinkle_tray_rust::runtime_hosts::TempSettings::default();
     let mut items = Vec::new();
-    // 显示器亮度快捷项由 worker 枚举后动态补入（等价 setTrayMenu 的 monitors 段）
+
+    // getTimeAdjustmentsMenuItem（equiv L4651-L4656）
+    let has_tod = settings
+        .get("adjustmentTimes")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if has_tod {
+        items.push(tray::TrayMenuItem {
+            id: 2001,
+            label: tt_localize::t("GENERIC_PAUSE_TOD"),
+            enabled: true,
+            checked: Some(temp.pause_time_adjustments),
+            separator: false,
+        });
+    }
+    // getDetectIdleMenuItem（equiv L4658-L4663）
+    let idle_enabled = settings
+        .get("detectIdleTimeEnabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if idle_enabled {
+        items.push(tray::TrayMenuItem {
+            id: 2002,
+            label: tt_localize::t("GENERIC_PAUSE_IDLE"),
+            enabled: true,
+            checked: Some(temp.pause_idle_detection),
+            separator: false,
+        });
+    }
+    // getProfilesMenuItem（equiv L4665-L4681:showInMenu && setBrightness 的 profile 平铺）
+    let profiles = settings
+        .get("profiles")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut profile_items = Vec::new();
+    for (idx, profile) in profiles.iter().enumerate() {
+        let show = profile.get("showInMenu").and_then(|v| v.as_bool()).unwrap_or(false);
+        let set_b = profile.get("setBrightness").and_then(|v| v.as_bool()).unwrap_or(false);
+        if show && set_b {
+            let name = profile.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            profile_items.push((2100 + idx as u32, name));
+        }
+    }
+    if !profile_items.is_empty() {
+        // 无子菜单 HMENU 支持,平铺为 id 2100+ 项(视觉与行为等价:点击应用 profile)
+        for (id, name) in &profile_items {
+            items.push(tray::TrayMenuItem {
+                id: *id,
+                label: name.clone(),
+                enabled: true,
+                checked: None,
+                separator: false,
+            });
+        }
+    }
+    // getPausableSeparatorMenuItem（equiv L4644-L4649）
+    if idle_enabled || has_tod || !profile_items.is_empty() {
+        items.push(tray::TrayMenuItem {
+            id: 0,
+            label: String::new(),
+            enabled: true,
+            checked: None,
+            separator: true,
+        });
+    }
+    // refresh displays（equiv L4635）
     items.push(tray::TrayMenuItem {
-        id: 1001,
-        label: tt_localize::t("PANEL_TITLE"),
+        id: 2003,
+        label: tt_localize::t("GENERIC_REFRESH_DISPLAYS"),
         enabled: true,
+        checked: None,
+        separator: false,
     });
+    // settings（equiv L4636）
     items.push(tray::TrayMenuItem {
         id: 1002,
         label: tt_localize::t("GENERIC_SETTINGS"),
         enabled: true,
+        checked: None,
+        separator: false,
     });
+    // separator
+    items.push(tray::TrayMenuItem {
+        id: 0,
+        label: String::new(),
+        enabled: true,
+        checked: None,
+        separator: true,
+    });
+    // getDebugTrayMenuItems（equiv L4683-L4698:isDev 时显示）
+    let is_dev = settings.get("isDev").and_then(|v| v.as_bool()).unwrap_or(false);
+    if is_dev {
+        items.push(tray::TrayMenuItem {
+            id: 2004,
+            label: "DEBUG: RESTART PANEL".to_string(),
+            enabled: true,
+            checked: None,
+            separator: false,
+        });
+        items.push(tray::TrayMenuItem {
+            id: 2005,
+            label: "DEBUG: HIDE PANEL".to_string(),
+            enabled: true,
+            checked: None,
+            separator: false,
+        });
+        items.push(tray::TrayMenuItem {
+            id: 2006,
+            label: "DEBUG: APPLY CURRENT TOD".to_string(),
+            enabled: true,
+            checked: None,
+            separator: false,
+        });
+    }
+    // turn off displays（保留原 1003 语义:原版 monitors 段的 turn off）
     items.push(tray::TrayMenuItem {
         id: 1003,
         label: tt_localize::t("PANEL_BUTTON_TURN_OFF_DISPLAYS"),
         enabled: true,
+        checked: None,
+        separator: false,
+    });
+    // quit（equiv L4639）
+    items.push(tray::TrayMenuItem {
+        id: 2000,
+        label: tt_localize::t("GENERIC_QUIT"),
+        enabled: true,
+        checked: None,
+        separator: false,
     });
     items
 }
 
+/// 托盘菜单构建时的 settings 快照(启动时的静态副本;checkbox 状态随菜单重建刷新)。
+/// 等价原版 setTrayMenu 在每次托盘创建时读取当前 settings/tempSettings。
+fn read_settings_snapshot() -> serde_json::Value {
+    match std::fs::read_to_string(&SETTINGS_PATH_SNAPSHOT.lock().unwrap().clone().unwrap_or_default()) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or(serde_json::json!({})),
+        Err(_) => serde_json::json!({}),
+    }
+}
+
+/// settings 路径快照(main 启动时写入,托盘菜单构建时读取)。
+static SETTINGS_PATH_SNAPSHOT: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
 /// 全局热键（equiv applyHotkeys）。
-fn start_hotkeys(settings: &serde_json::Value) {
+/// RegisterHotKeyW 需要一个消息窗口接收 WM_HOTKEY；托盘线程已创建消息窗口，
+/// 这里枚举该线程窗口句柄完成注册（注册 id = 10000+ 序号）。
+fn start_hotkeys(settings: &serde_json::Value, system: &mut twinkle_tray_rust::system_events::SystemEvents) {
+    // 等价 applyHotkeys 的注册主体在 system.apply_hotkeys_now 完成
+    // （托盘 hwnd 由托盘线程注册后通过 tray::tray_window_handle() 取得）
+    if let Some(hwnd) = tray::tray_window_handle() {
+        system.tray_hwnd = Some(hwnd);
+        system.apply_hotkeys_now(settings);
+        let _ = hwnd;
+    } else {
+        logger::log_as("MAIN", "warn", "Tray window unavailable; hotkeys not registered.");
+    }
     let parsed = twinkle_tray_rust::hotkey_host::parse_hotkeys(settings);
     logger::log_as(
         "MAIN",

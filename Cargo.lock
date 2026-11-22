@@ -4263,6 +4263,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "suncalc"
+version = "0.1.0"
+
+[[package]]
 name = "svgtypes"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4595,6 +4599,7 @@ dependencies = [
 name = "tray"
 version = "0.1.0"
 dependencies = [
+ "twutils",
  "windows",
 ]
 
@@ -4613,12 +4618,14 @@ name = "twinkle-tray-rust"
 version = "0.1.0"
 dependencies = [
  "ddcci",
+ "displayconfig",
  "monitor-thread-manager",
  "monitor-worker",
  "serde",
  "serde_json",
  "slint",
  "slint-build",
+ "suncalc",
  "tray",
  "tt-localize",
  "twutils",

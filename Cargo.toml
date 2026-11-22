@@ -13,6 +13,7 @@ members = [
     "crates/monitor-worker",
     "crates/monitor-thread-manager",
     "crates/tray",
+    "crates/suncalc",
 ]
 
 [package]
@@ -31,10 +32,15 @@ ddcci = { path = "crates/ddcci" }
 slint = { version = "1.19", features = ["backend-winit", "renderer-femtovg"] }
 wmibridge = { path = "crates/wmibridge" }
 twutils = { path = "crates/twutils" }
+displayconfig = { path = "crates/displayconfig" }
 tray = { path = "crates/tray" }
+suncalc = { path = "crates/suncalc" }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Registry",
+    "Win32_System_Time",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_Graphics_Gdi",

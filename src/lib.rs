@@ -8,6 +8,8 @@ pub mod logger;
 pub mod monitor_host;
 pub mod monitor_view;
 pub mod panel_controller;
+pub mod runtime_hosts;
+pub mod system_events;
 pub mod settings_host;
 pub mod settings_view;
 pub mod ui_types;
@@ -21,8 +23,10 @@ pub fn run_panel(
     host: Arc<monitor_host::MonitorHost>,
     settings: Arc<Mutex<serde_json::Value>>,
     tray_events: Option<std::sync::mpsc::Receiver<tray::TrayEvent>>,
+    runtime: Arc<runtime_hosts::RuntimeHost>,
+    system: system_events::SystemEvents,
 ) -> Result<(), String> {
-    panel_controller::run_panel_controller(host, settings, tray_events)
+    panel_controller::run_panel_controller_with_runtime(host, settings, tray_events, runtime, system)
 }
 
 /// 运行设置窗口（由面板/托盘触发，独立窗口）。
