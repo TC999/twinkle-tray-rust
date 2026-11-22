@@ -170,6 +170,29 @@ impl DdcSentinel {
     }
 }
 
+
+/// worker 级哨兵单例（等价 Monitors.js 模块级 sentinelDir/unstableDDC）。
+/// 由 run_monitor_worker 在启动时安装；未安装时返回空表（等价 unstableDDC = {}）。
+static SENTINEL_INSTANCE: Mutex<Option<&'static DdcSentinel>> = Mutex::new(None);
+
+/// 安装哨兵单例（进程内只调用一次）。
+pub fn install_sentinel(sentinel: &'static DdcSentinel) {
+    *SENTINEL_INSTANCE.lock().unwrap() = Some(sentinel);
+}
+
+/// 读取哨兵实例（未安装时为 None）。
+pub fn sentinel() -> Option<&'static DdcSentinel> {
+    *SENTINEL_INSTANCE.lock().unwrap()
+}
+
+/// unstableDDC 快照（等价模块级 `let unstableDDC = {}` 的当前值）。
+pub fn unstable_ddc_snapshot() -> HashMap<String, Value> {
+    match sentinel() {
+        Some(s) => s.unstable_ddc.lock().unwrap().clone(),
+        None => HashMap::new(),
+    }
+}
+
 /// 等价 L412: 优雅退出时清哨兵（process.on('exit')）。注册为进程退出钩子。
 pub fn register_exit_cleanup(sentinel: &'static DdcSentinel) {
     // Rust 无 process.on('exit')；等价实现：Drop guard 由 main 持有 +

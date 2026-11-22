@@ -415,6 +415,53 @@ pub fn determine_brightness_vcp_code(
     None
 }
 
+
+/// vcpCache 单条写入（equiv L1890-L1892：setVCP 成功后回写缓存当前值）。
+pub fn update_vcp_cache_value(monitor: &str, code: i64, value: f64) {
+    let vcp_string = vcp_str(code);
+    let mut cache = VCP_CACHE.lock().unwrap();
+    let map = cache.get_or_insert_with(HashMap::new);
+    if let Some(entry) = map.get_mut(monitor) {
+        if let Some(slot) = entry.get_mut(&format!("vcp_{}", vcp_string)) {
+            if let Some(arr) = slot.as_array_mut() {
+                if let Some(first) = arr.first_mut() {
+                    *first = json!(value);
+                }
+            }
+        }
+    }
+}
+
+/// vcpCache 单条读取（供 getBrightnessDDC 的 catastrophic 分支使用）。
+pub fn vcp_cache_value(monitor: &str, code: i64) -> Option<Value> {
+    let vcp_string = vcp_str(code);
+    let cache = VCP_CACHE.lock().unwrap();
+    cache
+        .as_ref()
+        .and_then(|m| m.get(monitor))
+        .and_then(|e| e.get(&format!("vcp_{}", vcp_string)))
+        .cloned()
+}
+
+/// monitorReports 单条写入（equiv L1457-L1459：monitor.capabilities 结果入缓存）。
+pub fn set_monitor_report(monitor: &str, report: Value) {
+    let mut reports = MONITOR_REPORTS.lock().unwrap();
+    reports
+        .get_or_insert_with(HashMap::new)
+        .insert(monitor.to_string(), report);
+}
+
+/// monitorReportsRaw 快照（getReport 响应需要）。
+pub fn monitor_reports_raw_snapshot() -> HashMap<String, String> {
+    let raw = MONITOR_REPORTS_RAW.lock().unwrap();
+    raw.as_ref().cloned().unwrap_or_default()
+}
+
+/// vcpCache 全量快照（getReport 响应需要）。
+pub fn vcp_cache_snapshot() -> HashMap<String, HashMap<String, Value>> {
+    let cache = VCP_CACHE.lock().unwrap();
+    cache.as_ref().cloned().unwrap_or_default()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

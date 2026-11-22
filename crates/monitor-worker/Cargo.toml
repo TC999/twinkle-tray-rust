@@ -12,7 +12,16 @@ ddcci = { path = "../ddcci" }
 wmibridge = { path = "../wmibridge" }
 displayconfig = { path = "../displayconfig" }
 twutils = { path = "../twutils" }
+# WinUSB/SetupAPI 用于 Studio Display USB 亮度控制（AGENTS.md §1.2：不引入 nusb）
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_Devices_Usb",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Storage_FileSystem",
+    # WinUsb_ControlTransfer 的 OVERLAPPED 出参在 Win32_System_IO 门控下
+    "Win32_System_IO",
 ] }
+
+[features]
+default = []

@@ -268,10 +268,17 @@ pub fn get_monitors_wmi() -> Result<HashMap<String, Value>, ()> {
     }
 }
 
-/// getBrightnessWMI 等价（equiv L1595-L1635）。
+/// getBrightnessWMI 等价（equiv L1595-L1635），不带 remaps 的便捷入口。
 pub fn get_brightness_wmi() -> Result<Option<Value>, ()> {
+    get_brightness_wmi_full(&Value::Object(Default::default()))
+}
+
+/// getBrightnessWMI 等价（equiv L1595-L1635）：
+/// 原生桥读数 -> hwid 规范化 -> applyRemap -> normalizeBrightness（原版三步逐字保留）。
+pub fn get_brightness_wmi_full(remaps: &Value) -> Result<Option<Value>, ()> {
     let result = wmibridge::get_brightness();
     if result.failed {
+        // Something went wrong：unsupported -> null（无面板可读），否则 -> false（失败）
         if result.unsupported {
             return Ok(None);
         }
@@ -287,6 +294,8 @@ pub fn get_brightness_wmi() -> Result<Option<Value>, ()> {
     }
     let hwid2_full = hwid[2].clone();
     let hwid2 = hwid2_full.split('_').next().unwrap_or(&hwid2_full).to_string();
+    let mut hwid = hwid;
+    hwid[2] = hwid2.clone();
     let brightness = result.brightness.unwrap_or(0);
 
     let mut wmi_info = json!({
@@ -297,8 +306,13 @@ pub fn get_brightness_wmi() -> Result<Option<Value>, ()> {
         "max": 100,
         "type": "wmi",
     });
+    // Get normalization info（原注释）
+    wmi_info = crate::wmi_fallback::apply_remap(wmi_info, remaps);
+    // Unnormalize brightness（原注释）
+    let min = wmi_info.get("min").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    let max = wmi_info.get("max").and_then(|v| v.as_i64()).unwrap_or(100) as i32;
     let brightness_raw = brightness;
-    let normalized = crate::settings_state::normalize_brightness(brightness_raw as f64, true, 0, 100);
+    let normalized = crate::settings_state::normalize_brightness(brightness_raw as f64, true, min, max);
     wmi_info["brightnessRaw"] = json!(brightness_raw);
     wmi_info["brightness"] = json!(normalized);
     Ok(Some(wmi_info))
@@ -421,4 +435,26 @@ pub fn determine_brightness_vcp_code(
     check_vcp_wait_ms: u64,
 ) -> Option<u8> {
     crate::features::determine_brightness_vcp_code(monitor, ddc_brightness_vcps, check_vcp_wait_ms)
+}
+
+/// getReport 的 lastDDCCIList（等价原版保存的 ddcci.getAllMonitors() 结果）。
+/// 字段名与原 addon 的返回一致（deviceKey/handleIsValid/ddcciSupported/...）。
+pub fn get_all_monitors_report() -> Vec<Value> {
+    ddcci::get_all_monitors()
+        .into_iter()
+        .map(|m| {
+            json!({
+                "deviceKey": m.device_key,
+                "deviceId": m.device_id,
+                "name": m.name,
+                "fullName": m.full_name,
+                "physicalName": m.physical_name,
+                "handleIsValid": m.handle_is_valid,
+                "ddcciSupported": m.ddcci_supported,
+                "hlBrightnessSupported": m.hl_brightness_supported,
+                "hlContrastSupported": m.hl_contrast_supported,
+                "result": m.result,
+            })
+        })
+        .collect()
 }
