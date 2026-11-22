@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # Original Source Code
 origin
+
+# Cargo workspace 成员使用根 Cargo.lock，成员目录的 lock 文件是独立构建残留
+crates/*/Cargo.lock
