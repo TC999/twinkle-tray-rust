@@ -26,7 +26,8 @@ pub struct WorkerProcess {
 
 pub struct MonitorThreadManager {
     process: Mutex<Option<WorkerProcess>>,
-    ready: AtomicBool,
+    /// 供 stdout 读取线程共享的就绪标志（等价 monitorsThreadReady 的跨线程可写性）。
+    ready: Arc<AtomicBool>,
     starting: AtomicBool,
     failed: AtomicBool,
     failed_reset_at: Mutex<Option<Instant>>,
@@ -36,13 +37,15 @@ pub struct MonitorThreadManager {
     recovering: AtomicBool,
     /// 事件回调（主进程注入；等价 monitorThread.on("message", ...)）。
     event_callback: Mutex<Option<Arc<dyn Fn(&Value) + Send + Sync>>>,
+    /// 失败提示回调（主进程注入；等价 dialog.showMessageBox，默认仅打印）。
+    failure_notice: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
 
 impl MonitorThreadManager {
     pub fn new(exe_path: String, datapath: String) -> Self {
         Self {
             process: Mutex::new(None),
-            ready: AtomicBool::new(false),
+            ready: Arc::new(AtomicBool::new(false)),
             starting: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             failed_reset_at: Mutex::new(None),
@@ -51,12 +54,18 @@ impl MonitorThreadManager {
             datapath: Mutex::new(datapath),
             recovering: AtomicBool::new(false),
             event_callback: Mutex::new(None),
+            failure_notice: Mutex::new(None),
         }
     }
 
     /// 注册 worker 事件回调。
     pub fn set_event_callback(&self, cb: Arc<dyn Fn(&Value) + Send + Sync>) {
         *self.event_callback.lock().unwrap() = Some(cb);
+    }
+
+    /// 注册失败提示回调（等价 dialog.showMessageBox 的替身；未注册时仅打印）。
+    pub fn set_failure_notice(&self, cb: Arc<dyn Fn(&str) + Send + Sync>) {
+        *self.failure_notice.lock().unwrap() = Some(cb);
     }
 
     /// 等价 before-quit 钩子。
@@ -104,15 +113,17 @@ impl MonitorThreadManager {
                 // stdout 读取线程：行协议 -> 事件回调（等价 monitorThread.on("message", ...)）
                 if let Some(stdout) = c.stdout.take() {
                     let cb = self.event_callback.lock().unwrap().clone();
+                    // 等价 monitorThread.on("message", ...) 的 ready 分支：
+                    // 读取线程直接置就绪标志（原版由主进程的 message 监听器完成）。
+                    let ready_flag = self.ready.clone();
                     std::thread::spawn(move || {
                         let reader = BufReader::new(stdout);
                         for line in reader.lines() {
                             match line {
                                 Ok(l) if !l.trim().is_empty() => {
                                     if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                                        // 等价 if (data?.type === "ready") mark_ready
                                         if v.get("type").and_then(|t| t.as_str()) == Some("ready") {
-                                            self_mark_ready();
+                                            ready_flag.store(true, Ordering::SeqCst);
                                         }
                                         if let Some(cb) = cb.as_ref() {
                                             cb(&v);
@@ -206,11 +217,16 @@ impl MonitorThreadManager {
         println!("Monitor thread error: {}", error);
 
         if !self.failed.swap(true, Ordering::SeqCst) {
-            // 等价 dialog.showMessageBox（首次失败才显示；主进程 UI 接入后替换）
-            println!(
-                "[Monitors thread failed] The monitors thread failed with the following message: {}",
+            // 等价 dialog.showMessageBox：只在首次失败时提示一次
+            let message = format!(
+                "The monitors thread failed with the following message: {}",
                 error
             );
+            let notice = self.failure_notice.lock().unwrap().clone();
+            match notice {
+                Some(cb) => cb(&message),
+                None => println!("[Monitors thread failed] {}", message),
+            }
         }
 
         self.stop();
@@ -238,19 +254,6 @@ impl MonitorThreadManager {
         }
         *guard = None;
     }
-}
-
-// 读取线程内无法引用 &self，用 thread_local 桥接 mark_ready。
-thread_local! {
-    static READY_FLAG: std::cell::RefCell<Option<std::sync::Arc<AtomicBool>>> = std::cell::RefCell::new(None);
-}
-
-fn self_mark_ready() {
-    READY_FLAG.with(|f| {
-        if let Some(flag) = f.borrow().as_ref() {
-            flag.store(true, Ordering::SeqCst);
-        }
-    });
 }
 
 /// CommandSender 实现（供 MonitorCommandQueue 驱动）。

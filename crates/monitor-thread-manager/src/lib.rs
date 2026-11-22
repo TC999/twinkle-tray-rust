@@ -11,7 +11,8 @@ pub mod settings;
 pub mod thread_manager;
 
 pub use queue::{MonitorCommandQueue, COMMANDS_MUTATE_WORKER_STATE, COMMANDS_REQUIRED_BEFORE_REFRESH};
-pub use thread_manager::MonitorThreadManager;
+pub use settings::{default_settings, generate_uuid, read_and_migrate_settings, temp_settings};
+pub use thread_manager::{ManagerSender, MonitorThreadManager};
 
 use serde_json::Value;
 
