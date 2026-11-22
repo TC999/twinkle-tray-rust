@@ -8,4 +8,7 @@ pub mod hotkey;
 pub mod tray_icon;
 
 pub use hotkey::{register_hotkey, unregister_hotkey, HotkeyReceiver};
-pub use tray_icon::{create_tray_icon, remove_tray_icon, TrayConfig, TrayIconHandle};
+pub use tray_icon::{
+    create_tray_icon, remove_tray_icon, run_message_loop, set_tray_callback, spawn_tray_thread,
+    stop_tray_thread, update_tray_icon, TrayConfig, TrayEvent, TrayIconHandle, TrayMenuItem,
+};
