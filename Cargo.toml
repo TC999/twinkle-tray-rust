@@ -24,6 +24,7 @@ edition = "2021"
 tt-localize = { path = "crates/tt-localize" }
 vcp-codes = { path = "crates/vcp-codes" }
 monitor-worker = { path = "crates/monitor-worker" }
+monitor-thread-manager = { path = "crates/monitor-thread-manager" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ddcci = { path = "crates/ddcci" }

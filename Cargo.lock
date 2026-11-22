@@ -4613,6 +4613,7 @@ name = "twinkle-tray-rust"
 version = "0.1.0"
 dependencies = [
  "ddcci",
+ "monitor-thread-manager",
  "monitor-worker",
  "serde",
  "serde_json",
