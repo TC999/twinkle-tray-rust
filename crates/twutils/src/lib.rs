@@ -28,6 +28,7 @@ pub mod app_startup;
 pub mod brightness_keys;
 pub mod display_brightness;
 pub mod media_status;
+pub mod monitor_power;
 pub mod power_events;
 pub mod window_material;
 pub mod window_utils;
