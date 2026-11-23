@@ -654,6 +654,8 @@ fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value)
 
     // 演示用 settings：开启对比度/音量/输入源特征，覆盖 extended 分支
     let mut demo_settings = settings.clone();
+    // demo 不联网：打开设置窗口会走真实 checkForUpdates 路径
+    demo_settings["checkForUpdates"] = serde_json::json!(false);
     if let Some(first_key) = monitors.as_object().and_then(|o| o.keys().next()).cloned() {
         let hwid1 = monitors
             .get(&first_key)
@@ -709,23 +711,23 @@ fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value)
             let _ = panel.window().set_position(slint::PhysicalPosition::new(60, 60));
             let _ = panel.show();
 
-            // 设置窗口：monitors 页
-            if let Ok(ui) = twinkle_tray_rust::SettingsWindow::new() {
-                twinkle_tray_rust::window_state::apply_settings_theme(&ui, &demo_settings);
-                ui.set_pages(slint::ModelRc::new(slint::VecModel::from(
-                    twinkle_tray_rust::settings_view::build_pages(),
-                )));
-                ui.set_monitors(slint::ModelRc::new(slint::VecModel::from(
-                    twinkle_tray_rust::settings_view::build_monitor_entries(&demo_monitors, &demo_settings),
-                )));
-                ui.set_items(slint::ModelRc::new(slint::VecModel::from(
-                    twinkle_tray_rust::settings_view::build_items("monitors", &demo_settings),
-                )));
-                ui.set_active_page("monitors".into());
-                let _ = ui.window().set_position(slint::PhysicalPosition::new(440, 60));
-                let _ = ui.show();
-                println!("demo windows shown (panel + settings/monitors)");
-                let _ = slint::run_event_loop_until_quit();
+            // 设置窗口：走真实 open_settings_window 路径（验证 monitors 模型注入与刷新接线），
+            // 再切到 monitors 页供截图对拍。此前这里手工 set_monitors，掩盖了
+            // "真实打开路径从不注入显示器列表" 的缺陷。
+            let settings_shared = std::sync::Arc::new(std::sync::Mutex::new(demo_settings.clone()));
+            match twinkle_tray_rust::settings_host::open_settings_window(settings_shared, host.clone()) {
+                Ok(handle) => {
+                    let ui = &handle.ui;
+                    ui.set_active_page("monitors".into());
+                    ui.set_items(slint::ModelRc::new(slint::VecModel::from(
+                        twinkle_tray_rust::settings_view::build_items("monitors", &demo_settings),
+                    )));
+                    let _ = ui.window().set_position(slint::PhysicalPosition::new(440, 60));
+                    println!("demo windows shown (panel + settings/monitors)");
+                    println!("settings monitors: {}", handle.monitors_model.row_count());
+                    let _ = slint::run_event_loop_until_quit();
+                }
+                Err(e) => println!("settings window FAILED: {}", e),
             }
         }
     }

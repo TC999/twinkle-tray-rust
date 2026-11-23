@@ -10,12 +10,38 @@
 use crate::settings_view;
 use crate::window_state;
 use serde_json::{json, Value};
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model, ModelRc, VecModel};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 /// 设置窗口句柄（调用方需持有，drop 即销毁窗口）。
 pub struct SettingsWindowHandle {
     pub ui: crate::SettingsWindow,
+    /// 显示器列表模型的单实例（首帧注入，之后按行增量更新）。
+    /// 等价 React 的 key 复用：整表重建会让正在编辑的重命名框失焦。
+    pub monitors_model: Rc<VecModel<crate::ui_types::SettingsMonitorEntry>>,
+    /// 上次注入的 worker monitors 快照（用于判重，避免每帧重建模型）。
+    pub last_monitors: Mutex<Value>,
+    /// 显示器相关设置（remaps/hideDisplays/names/...）已改动，下一 tick 强制刷新列表。
+    pub needs_monitor_refresh: std::cell::Cell<bool>,
+}
+
+thread_local! {
+    /// 设置窗口句柄（主线程独占；Slint 组件不可跨线程）。
+    static SETTINGS_WINDOW: std::cell::RefCell<Option<SettingsWindowHandle>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 设置窗口槽位（等价原版 Electron 的单一 settingsBrowserWindow 引用）。
+pub fn settings_window_slot() -> &'static std::cell::RefCell<Option<SettingsWindowHandle>> {
+    SETTINGS_WINDOW.with(|slot| unsafe { &*(slot as *const std::cell::RefCell<_>) })
+}
+
+/// 标记显示器数据脏（设置窗口内改动 hide/gamma/SDR/remap 等后调用）。
+pub fn mark_monitors_dirty() {
+    if let Some(handle) = settings_window_slot().borrow().as_ref() {
+        handle.needs_monitor_refresh.set(true);
+    }
 }
 
 /// 在当前（主）线程创建并显示设置窗口。
@@ -34,24 +60,41 @@ pub fn open_settings_window(
         "general",
         &snapshot,
     )));
+
+    // 显示器列表：打开即注入主进程缓存（equiv SettingsWindow componentDidMount 时
+    // this.state.monitors 已由主进程填充）。此前漏注入 → monitors 模型恒为空
+    // → 「显示器设置」页整页没有内容（本次修复的核心）。
+    let monitors = host.monitors_snapshot();
+    let monitors_model = Rc::new(VecModel::from(settings_view::build_monitor_entries(
+        &monitors,
+        &snapshot,
+    )));
+    ui.set_monitors(ModelRc::new(monitors_model.clone()));
+
     apply_texts(&ui);
 
     wire_callbacks(&ui, settings.clone(), host.clone());
     ui.show().map_err(|e| e.to_string())?;
 
+    // 打开设置即请求一次显示器刷新（equiv getSidebar onClick 的 window.requestMonitors()）
+    host.refresh_monitors(false, false);
+
     // 设置窗口打开即检查更新（equiv SettingsWindow componentDidMount L211 window.checkForUpdates()）
     let snapshot = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
     crate::update_host::check_for_updates(&snapshot, false, update_path());
 
-    Ok(SettingsWindowHandle { ui })
+    Ok(SettingsWindowHandle {
+        ui,
+        monitors_model,
+        last_monitors: Mutex::new(monitors),
+        needs_monitor_refresh: std::cell::Cell::new(false),
+    })
 }
 
 /// 重新注入显示器列表与热键（settings/monitors 更新时调用）。
 pub fn refresh_settings_view(handle: &SettingsWindowHandle, settings: &Value, monitors: &Value) {
     let ui = &handle.ui;
-    ui.set_monitors(settings_view::model(
-        settings_view::build_monitor_entries(monitors, settings),
-    ));
+    refresh_settings_monitors(handle, settings, monitors);
     ui.set_hotkeys(settings_view::model(settings_view::build_hotkeys(settings)));
     let page = ui.get_active_page().to_string();
     ui.set_items(settings_view::model(settings_view::build_items(
@@ -59,6 +102,76 @@ pub fn refresh_settings_view(handle: &SettingsWindowHandle, settings: &Value, mo
         settings,
     )));
     window_state::apply_settings_theme(ui, settings);
+}
+
+/// 刷新设置窗口的显示器列表（equiv 原版 `monitorsUpdated` -> setState({monitors})）。
+///
+/// 只在 worker monitors 快照变化时重建模型，且按行增量更新：
+/// 整表重建会销毁正在编辑的重命名输入框（与面板 Round 10 的教训同源）。
+pub fn refresh_settings_monitors(
+    handle: &SettingsWindowHandle,
+    settings: &Value,
+    monitors: &Value,
+) {
+    let dirty = handle.needs_monitor_refresh.replace(false);
+    let changed = {
+        let mut last = match handle.last_monitors.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if *last == *monitors {
+            false
+        } else {
+            *last = monitors.clone();
+            true
+        }
+    };
+    if !changed && !dirty {
+        return;
+    }
+
+    let entries = settings_view::build_monitor_entries(monitors, settings);
+    let model = &handle.monitors_model;
+    while model.row_count() > entries.len() {
+        model.remove(model.row_count() - 1);
+    }
+    for (index, entry) in entries.into_iter().enumerate() {
+        let unchanged = model
+            .row_data(index)
+            .map(|old| settings_monitor_equal(&old, &entry))
+            .unwrap_or(false);
+        if unchanged {
+            continue;
+        }
+        if index < model.row_count() {
+            model.set_row_data(index, entry);
+        } else {
+            model.push(entry);
+        }
+    }
+}
+
+/// 两行显示器条目是否等价（用于增量更新判定）。
+fn settings_monitor_equal(
+    a: &crate::ui_types::SettingsMonitorEntry,
+    b: &crate::ui_types::SettingsMonitorEntry,
+) -> bool {
+    a.key == b.key
+        && a.id == b.id
+        && a.name == b.name
+        && a.title == b.title
+        && a.rename == b.rename
+        && a.hidden == b.hidden
+        && a.gamma == b.gamma
+        && a.sdr == b.sdr
+        && a.extend_minimum == b.extend_minimum
+        && a.breakpoint == b.breakpoint
+        && a.connection == b.connection
+        && a.hdr == b.hdr
+        && a.brightness == b.brightness
+        && a.maximum == b.maximum
+        && a.normalization == b.normalization
+        && a.details == b.details
 }
 
 /// 接线全部设置窗口回调。
@@ -175,6 +288,66 @@ fn wire_callbacks(
     let snap = settings.clone();
     ui.on_monitor_moved(move |key, delta| {
         move_monitor(&snap, &key, delta);
+    });
+
+    // 亮度归一化（equiv minMaxChanged L276-L330）：monitor-id + "min"/"max" + 0-100
+    let snap = settings.clone();
+    let worker = host.clone();
+    ui.on_monitor_remap(move |monitor_id, field, value| {
+        let field = field.to_string();
+        if field != "min" && field != "max" {
+            return;
+        }
+        if let Some(updated) = update_remap(&snap, &monitor_id, &field, value as f64) {
+            apply_side_effects(&worker, "remaps", &updated);
+            mark_monitors_dirty();
+        }
+    });
+
+    // 校准点增删改（equiv addCalibrationPoint / updateCalibrationPoint /
+    // deleteCalibrationPoint L536-L570）
+    let snap = settings.clone();
+    let worker = host.clone();
+    ui.on_calibration_added(move |monitor_id| {
+        if let Some(updated) = with_calibration(&snap, &monitor_id, |points| {
+            points.push(json!({"input": 0, "output": 100}));
+        }) {
+            apply_side_effects(&worker, "remaps", &updated);
+            mark_monitors_dirty();
+        }
+    });
+
+    let snap = settings.clone();
+    let worker = host.clone();
+    ui.on_calibration_changed(move |monitor_id, index, field, value| {
+        let field = field.to_string();
+        if field != "input" && field != "output" {
+            return;
+        }
+        if let Some(updated) = with_calibration(&snap, &monitor_id, |points| {
+            if let Some(point) = points.get_mut(index as usize) {
+                if let Some(obj) = point.as_object_mut() {
+                    obj.insert(field.clone(), json!(value));
+                }
+            }
+        }) {
+            apply_side_effects(&worker, "remaps", &updated);
+            mark_monitors_dirty();
+        }
+    });
+
+    let snap = settings.clone();
+    let worker = host.clone();
+    ui.on_calibration_removed(move |monitor_id, index| {
+        if let Some(updated) = with_calibration(&snap, &monitor_id, |points| {
+            let idx = index as usize;
+            if idx < points.len() {
+                points.remove(idx);
+            }
+        }) {
+            apply_side_effects(&worker, "remaps", &updated);
+            mark_monitors_dirty();
+        }
     });
 
     // 热键（equiv addHotkey / deleteHotkey）
@@ -369,6 +542,83 @@ fn set_monitor_flag(settings: &Arc<Mutex<Value>>, field: &str, key: &str, value:
     }
 }
 
+/// 亮度归一化 remap 写入（equiv minMaxChanged L276-L330 的 min/max 互锁）。
+fn update_remap(
+    settings: &Arc<Mutex<Value>>,
+    monitor_id: &str,
+    field: &str,
+    value: f64,
+) -> Option<Value> {
+    let mut guard = settings.lock().ok()?;
+    if guard.get("remaps").is_none() {
+        guard["remaps"] = json!({});
+    }
+    let remaps = guard.get_mut("remaps")?.as_object_mut()?;
+    let entry = remaps
+        .entry(monitor_id.to_string())
+        .or_insert_with(|| json!({"min": 0, "max": 100, "calibration": []}));
+    if entry.get("calibration").is_none() {
+        entry["calibration"] = json!([]);
+    }
+    let mut min = entry.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let mut max = entry.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0);
+    if field == "min" {
+        // equiv L289-L304：min 上移时保持 max - min >= 10 且 max <= 100
+        min = value;
+        if min > max - 10.0 {
+            max = min + 10.0;
+        }
+        if max > 100.0 {
+            max = 100.0;
+        }
+        if min > max - 10.0 {
+            min = max - 10.0;
+        }
+    } else {
+        // equiv L306-L322：max 下移时保持 max - min >= 10 且 min >= 0
+        max = value;
+        if min > max - 10.0 {
+            min = max - 10.0;
+        }
+        if min < 0.0 {
+            min = 0.0;
+        }
+        if min > max - 10.0 {
+            max = min + 10.0;
+        }
+    }
+    entry["min"] = json!(min);
+    entry["max"] = json!(max);
+    let updated = guard.clone();
+    drop(guard);
+    schedule_write_settings(settings);
+    Some(updated)
+}
+
+/// 校准点写回（add / update / delete 共用；equiv L536-L570）。
+fn with_calibration<F>(settings: &Arc<Mutex<Value>>, monitor_id: &str, f: F) -> Option<Value>
+where
+    F: FnOnce(&mut Vec<Value>),
+{
+    let mut guard = settings.lock().ok()?;
+    if guard.get("remaps").is_none() {
+        guard["remaps"] = json!({});
+    }
+    let remaps = guard.get_mut("remaps")?.as_object_mut()?;
+    let entry = remaps
+        .entry(monitor_id.to_string())
+        .or_insert_with(|| json!({"min": 0, "max": 100, "calibration": []}));
+    if entry.get("calibration").is_none() {
+        entry["calibration"] = json!([]);
+    }
+    let points = entry.get_mut("calibration")?.as_array_mut()?;
+    f(points);
+    let updated = guard.clone();
+    drop(guard);
+    schedule_write_settings(settings);
+    Some(updated)
+}
+
 /// 显示器排序（equiv onDragEnd L228-L258：order 数组存 id）。
 fn move_monitor(settings: &Arc<Mutex<Value>>, key: &str, delta: i32) {
     let mut guard = match settings.lock() {
@@ -544,6 +794,17 @@ fn apply_texts(ui: &crate::SettingsWindow) {
     ui.set_t_hotkeys_remove(tt_localize::t("GENERIC_DELETE").into());
     ui.set_t_hotkeys_record(tt_localize::t("SETTINGS_HOTKEYS_PRESS_KEYS_HINT").into());
     ui.set_t_no_hotkeys(tt_localize::t("SETTINGS_HOTKEYS_NONE").into());
+    // monitors 页：All Displays 标题与空态提示（equiv getInfoMonitors 的两条分支）
+    ui.set_t_all_displays(tt_localize::t("GENERIC_ALL_DISPLAYS").into());
+    ui.set_t_no_displays(tt_localize::t("GENERIC_NO_COMPATIBLE_DISPLAYS").into());
+    // 亮度归一化段（equiv getMinMaxMonitors / getMonitorCalibration）
+    ui.set_t_minimum(tt_localize::t("GENERIC_MINIMUM").into());
+    ui.set_t_maximum(tt_localize::t("GENERIC_MAXIMUM").into());
+    ui.set_t_calibration_point(tt_localize::t("GENERIC_CALIBRATION_POINT").into());
+    ui.set_t_delete(tt_localize::t("GENERIC_DELETE").into());
+    // 原版校准点标签为硬编码英文（L520-L525），无本地化键，照抄
+    ui.set_t_calibration_input("Input".into());
+    ui.set_t_calibration_output("Output".into());
 }
 
 /// 便捷入口：用默认 settings 打开（--settings-smoke 用）。
@@ -670,6 +931,51 @@ mod tests {
         std::env::remove_var("TT_SETTINGS_PATH");
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_remap_min_keeps_gap_and_caps_max() {
+        // equiv minMaxChanged L289-L304：min 上移时 max = min + 10，且不超过 100
+        let settings = Arc::new(Mutex::new(json!({})));
+        let updated = update_remap(&settings, "DISPLAY1", "min", 95.0).unwrap();
+        assert_eq!(updated["remaps"]["DISPLAY1"]["min"], json!(90.0));
+        assert_eq!(updated["remaps"]["DISPLAY1"]["max"], json!(100.0));
+    }
+
+    #[test]
+    fn update_remap_max_keeps_gap_and_caps_min() {
+        // equiv L306-L322：max 下移时 min = max - 10，且不低于 0
+        let settings = Arc::new(Mutex::new(json!({})));
+        let updated = update_remap(&settings, "DISPLAY1", "max", 5.0).unwrap();
+        assert_eq!(updated["remaps"]["DISPLAY1"]["max"], json!(10.0));
+        assert_eq!(updated["remaps"]["DISPLAY1"]["min"], json!(0.0));
+    }
+
+    #[test]
+    fn calibration_points_add_update_remove() {
+        let settings = Arc::new(Mutex::new(json!({})));
+        let updated = with_calibration(&settings, "DISPLAY1", |points| {
+            points.push(json!({"input": 0, "output": 100}));
+        })
+        .unwrap();
+        assert_eq!(updated["remaps"]["DISPLAY1"]["calibration"].as_array().unwrap().len(), 1);
+
+        let updated = with_calibration(&settings, "DISPLAY1", |points| {
+            points[0]["input"] = json!(25.0);
+            points[0]["output"] = json!(40.0);
+        })
+        .unwrap();
+        assert_eq!(updated["remaps"]["DISPLAY1"]["calibration"][0]["input"], json!(25.0));
+        assert_eq!(updated["remaps"]["DISPLAY1"]["calibration"][0]["output"], json!(40.0));
+
+        let updated = with_calibration(&settings, "DISPLAY1", |points| {
+            points.remove(0);
+        })
+        .unwrap();
+        assert!(updated["remaps"]["DISPLAY1"]["calibration"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

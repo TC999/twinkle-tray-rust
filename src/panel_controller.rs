@@ -673,14 +673,9 @@ fn wire_callbacks(
     });
 }
 
-thread_local! {
-    /// 设置窗口句柄（主线程独占；Slint 组件不可跨线程）。
-    static SETTINGS_WINDOW: std::cell::RefCell<Option<crate::settings_host::SettingsWindowHandle>> =
-        const { std::cell::RefCell::new(None) };
-}
-
+/// 设置窗口槽位（实现在 settings_host：设置页回调也要能标记脏状态）。
 fn settings_window_slot() -> &'static std::cell::RefCell<Option<crate::settings_host::SettingsWindowHandle>> {
-    SETTINGS_WINDOW.with(|slot| unsafe { &*(slot as *const std::cell::RefCell<_>) })
+    crate::settings_host::settings_window_slot()
 }
 
 /// 取显示器的 (hwid 拼接串, id)。
@@ -1030,6 +1025,30 @@ fn tick(
 
     // 4) 刷新 UI model
     refresh_ui(ui, state);
+
+    // 5) 设置窗口跟随 worker 的 monitors 事件（equiv monitorsUpdated -> setState）
+    sync_settings_window(controller);
+}
+
+/// 把最新显示器列表同步进已打开的设置窗口。
+///
+/// equiv: origin/src/components/SettingsWindow.jsx:L182-L185 的
+/// `window.addEventListener("monitorsUpdated", this.recievedMonitors)`：
+/// 主进程每次推送显示器列表，设置窗口就重建 monitors 页的数据源。
+fn sync_settings_window(controller: &Rc<PanelController>) {
+    let slot = settings_window_slot();
+    if slot.borrow().is_none() {
+        return;
+    }
+    let monitors = controller.host.monitors_snapshot();
+    let settings = controller
+        .settings
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or(json!({}));
+    if let Some(handle) = slot.borrow().as_ref() {
+        crate::settings_host::refresh_settings_monitors(handle, &settings, &monitors);
+    }
 }
 
 /// 刷新面板更新条（读取 update_host 共享状态;equiv panel-preload 的 latest-version/updateProgress 监听）。

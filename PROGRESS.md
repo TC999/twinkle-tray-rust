@@ -486,3 +486,80 @@ Shell_NotifyIconGetRect → HRESULT=0x00000000 (S_OK)
 `throttle_keeps_latest_value`、`vcp_key_normalization` 覆盖节流器其余行为）。
 
 **质量状态（Round 10）**：`cargo build --workspace` 零错误零警告；真机 e2e（滑条渲染 / 点击 / 拖动 / 数值框 / 显隐循环）通过。
+
+
+## Round 11 · 2026-11-24：修复「显示器设置」页面全空
+
+### 症状
+
+托盘左键弹出面板 → 齿轮打开设置 → 点击左侧「显示器设置」，右侧内容区**完全空白**：
+既没有「所有显示器」信息块，也没有亮度更新速率/隐藏内部显示器等设置项。
+`--ui-demo` 下因手工注入 monitors 模型才看得到内容，掩盖了真实路径的缺陷。
+
+### 根因（四处叠加）
+
+| # | 缺陷 | 位置 | 后果 |
+|---|---|---|---|
+| 1 | **打开设置窗口时从未注入 monitors 模型** | `settings_host::open_settings_window` | `root.monitors` 恒为 `[]`，逐台列表零行 |
+| 2 | **monitors 页的 items 被渲染分支排除** | `ui/settings.slint` 的 `if (active-page != "monitors" && != "hotkeys")` | `build_items("monitors")` 构建的 8 个全局项（更新速率/隐藏内屏/睡眠动作/电源值/平衡亮度说明）永远不渲染 |
+| 3 | **`refresh_settings_view` 从未被调用** | 全仓无调用点 | worker 的 `refreshMonitors`/`monitorsEnriched` 只更新面板，设置窗口数据陈旧 |
+| 4 | **monitors 页缺原版内容** | `ui/settings.slint` + `settings_view::monitors_page` | 缺「All Displays」明细（名称/内部名称/通信方式/当前亮度/最大亮度/统一区间/HDR）、缺归一化 min/max 滑块与校准点 |
+
+### 修复
+
+1. **打开即注入**（`settings_host.rs`）：`open_settings_window` 用 `host.monitors_snapshot()` 构造
+   `SettingsMonitorEntry` 列表注入 `set_monitors`，并请求一次 `refresh_monitors(false, false)`
+   （equiv 原版 `window.requestMonitors()`）。
+2. **事件驱动同步**（`panel_controller.rs` + `settings_host.rs`）：tick 每 50ms 调
+   `refresh_settings_monitors`，等价原版 `window.addEventListener("monitorsUpdated", this.recievedMonitors)`。
+   以 `last_monitors` 判重 + `needs_monitor_refresh` 脏标记，命中才重建；模型单实例 + 按行
+   `set_row_data` 增量更新（整表重建会让正在编辑的重命名框失焦，同 Round 10 教训）。
+3. **Slint 结构对齐原版三段**（`ui/settings.slint`）：
+   - 抽出 `SettingsItems` 组件，供 general/features/time/updates/light-sensor/debug 与 monitors 页共用，
+     消除「monitors 页不渲染 items」的分支缺陷；
+   - monitors 页 = ①All Displays（`getInfoMonitors` 明细，空时显示 `GENERIC_NO_COMPATIBLE_DISPLAYS`）
+     ②全局 SettingsOption 列表 ③逐台控制卡（重命名 / 隐藏 / 排序↑↓ / Gamma / Extend Minimum+断点 /
+     SDR / min-max 滑块 / 校准点增删）；
+   - 新增 `MiniSlider`（equiv `Slider.jsx type=min/max`）与逐台 `calibration` 模型字段。
+4. **显示语义对齐 `getInfoMonitors`**（`settings_view.rs`）：`brightness`/`maximum`/`normalization`
+   按 `displayLevel` 只取整；`type=ddcci` 且无 `brightnessType` → `"???"`；`type=none` → Not supported。
+5. **remaps 写回**（`settings_host.rs`）：`monitor_remap` 实现原版 min/max 互锁（间隔 ≥10、边界 0/100），
+   `calibration_*` 实现增删改；均走 `apply_side_effects` 下发 worker 并标记脏。
+
+### 真机对拍（2026-11-24 · 1920×1080 @125%，Win11，内屏 CMN1521 / WMI）
+
+```
+# 修复前（真实托盘路径）
+托盘左键 → 面板 → 齿轮 → 「显示器设置」→ 右侧内容区 0 个可见元素
+
+# 修复后（真实托盘路径，未注模）
+PostMessage(TwinkleTrayTrayClass, WM_TRAY_ICON/WM_LBUTTONUP)
+  → 面板「调整亮度」hwnd=1575286 rect=1168,678,1524,812
+点击面板齿轮 → 设置窗口 hwnd=1967168 rect=154,154,914,714
+点击侧边栏「显示器设置」→
+  所有显示器：Display 1 / 名称 Display 1 / 内部名称 CMN1521 / 通信方式 WMI
+              当前亮度 66 / 最大亮度 不支持 / 统一亮度区间 0 - 100 / HDR 不支持
+  显示器设置：亮度更新速度（一般 500ms）/ 隐藏不活动的内部显示器 / 睡眠动作 PowerShell …
+  （继续下滚）平衡亮度段 + Display 1 控制卡：重命名输入框、隐藏/Gamma/SDR 开关、
+   Extend Minimum、最小值 0 / 最大值 100 滑块、+ 校准点
+```
+
+`--ui-demo` 已改为走真实 `open_settings_window`（此前手工 `set_monitors` 掩盖缺陷），
+输出 `settings monitors: 1`，截图与上述一致。
+
+### 回归测试
+
+`cargo test --workspace` 全绿（新增/更新 7 个用例）：
+`monitor_entry_connection_labels`（detail/亮度语义）、`monitor_entry_ddcci_without_brightness_type_shows_unknown`、
+`monitor_entry_none_type_reports_not_supported`、`monitors_page_renders_all_display_items`、
+`update_remap_min_keeps_gap_and_caps_max`、`update_remap_max_keeps_gap_and_caps_min`、
+`calibration_points_add_update_remove`。
+
+**质量状态（Round 11）**：`cargo build --workspace` 零错误零警告；真机 e2e（托盘 → 面板 → 设置 → 显示器设置）通过；
+点击 min 滑块可落盘到 `settings.remaps`（实测 `{"DISPLAY1":{"min":90,"max":100}}`）。
+
+### 已知差异（记录，不阻塞）
+
+- 面板/设置窗口的关闭采用 `hide()` 而非销毁（Slint 无等价 Electron `window.close()`），沿用 Round 8 记录。
+- 设置页重排（拖拽）降级为上下移按钮（Slint 无拖拽列表），语义等价。
+- `SETTINGS_MONITORS_GAMMA_SLIDER_TITLE` 在 zh-Hans.ftl 缺失 → 回退 en（源 zh-Hans.json 同样缺该键，属本地化数据差异）。

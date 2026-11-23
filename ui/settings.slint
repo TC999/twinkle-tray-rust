@@ -43,6 +43,13 @@ export struct SettingsPage {
     glyph: string,
 }
 
+// 校准点（equiv settings.remaps[id].calibration[]：input 为滑块级别，output 为实际下发级别）
+export struct SettingsCalibrationPoint {
+    index: int,
+    input: float,
+    output: float,
+}
+
 // 显示器设置行（equiv renderMonitorInfo / 重命名 / 隐藏 / gamma / extend minimum / SDR）
 export struct SettingsMonitorEntry {
     key: string,
@@ -54,12 +61,21 @@ export struct SettingsMonitorEntry {
     sdr: bool,
     extend-minimum: bool,
     breakpoint: int,
+    // 标题（equiv getInfoMonitors 的 monitor.name 原始名）
+    title: string,
+    // 亮度归一化的 remap min/max（equiv settings.remaps[id].min/max，0-100）
+    remap-min: float,
+    remap-max: float,
     // 连接方式（equiv getDebugMonitorType）
     connection: string,
     hdr: string,
     brightness: string,
     maximum: string,
     normalization: string,
+    // equiv getInfoMonitors 的多行明细（Name/Internal Name/Communication/.../HDR）
+    details: string,
+    // 校准点（equiv getMonitorCalibration 的逐台列表）
+    calibration: [SettingsCalibrationPoint],
 }
 
 export struct SettingsHotkey {
@@ -122,6 +138,71 @@ component Toggle inherits Rectangle {
     TouchArea {
         enabled: root.enabled;
         clicked => { root.toggled(!root.checked); }
+    }
+}
+
+
+// 归一化滑块（equiv Slider.jsx type="min"/"max"，height="short"：轨道 + 手柄，0-100）
+component MiniSlider inherits Rectangle {
+    in property <float> level: 50;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    callback changed(float);
+
+    min-width: 60px;
+    height: 20px;
+    background: transparent;
+    property <float> ratio: (root.maximum > root.minimum)
+        ? clamp((clamp(root.level, root.minimum, root.maximum) - root.minimum) / (root.maximum - root.minimum), 0, 1)
+        : 0;
+    property <length> thumb-width: 8px;
+    property <length> track-height: 3px;
+
+    Rectangle {
+        x: 0;
+        y: (parent.height - root.track-height) / 2;
+        width: parent.width;
+        height: root.track-height;
+        border-radius: root.track-height / 2;
+        background: Theme.slider-track;
+    }
+    Rectangle {
+        x: 0;
+        y: (parent.height - root.track-height) / 2;
+        width: parent.width * root.ratio;
+        height: root.track-height;
+        border-radius: root.track-height / 2;
+        background: Theme.accent-medium;
+    }
+    Rectangle {
+        x: (parent.width - root.thumb-width) * root.ratio;
+        y: (parent.height - 16px) / 2;
+        width: root.thumb-width;
+        height: 16px;
+        border-radius: 3px;
+        background: Theme.accent-medium;
+    }
+    ta := TouchArea {
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.set-from-x(self.mouse-x);
+                return EventResult.accept;
+            }
+            if (e.kind == PointerEventKind.move && self.pressed) {
+                root.set-from-x(self.mouse-x);
+                return EventResult.accept;
+            }
+            EventResult.reject
+        }
+    }
+    public function set-from-x(x: length) {
+        if (root.maximum <= root.minimum) { return; }
+        let usable = max(root.width - root.thumb-width, 1px);
+        let r = clamp((x - root.thumb-width / 2) / usable, 0, 1);
+        let v = round(root.minimum + r * (root.maximum - root.minimum));
+        if (v != round(root.level)) {
+            root.changed(v);
+        }
     }
 }
 
@@ -231,6 +312,47 @@ component SettingsRow inherits Rectangle {
 
 }
 
+
+// 设置项列表（equiv SettingsWindow.jsx 每页的 SettingsOption 序列）。
+//
+// 抽成组件供全部页面共用：此前 general/features/time/updates/debug 页与
+// monitors/hotkeys 页各写一份渲染分支，monitors 页的 items 因条件排除而
+// 整段不渲染 —— 表现为「显示器设置」页除逐台卡片外没有全局设置项。
+component SettingsItems inherits VerticalLayout {
+    in property <[SettingsItem]> items: [];
+    callback item-toggle(string, bool);
+    callback item-choice(string, string);
+    callback item-button(string);
+
+    spacing: 4px;
+    for item in root.items : VerticalLayout {
+        spacing: 0px;
+        if (item.kind == SettingsItemKind.section) : Rectangle {
+            height: 34px;
+            background: transparent;
+            Text {
+                text: item.title;
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text;
+                vertical-alignment: bottom;
+            }
+        }
+        if (item.kind == SettingsItemKind.note) : Text {
+            text: item.title;
+            font-size: 12px;
+            color: Theme.text-mid;
+            wrap: word-wrap;
+        }
+        if (item.kind != SettingsItemKind.section && item.kind != SettingsItemKind.note) : SettingsRow {
+            item: item;
+            toggle-changed(v) => { root.item-toggle(item.key, v); }
+            choice-picked(v) => { root.item-choice(item.key, v); }
+            button-clicked => { root.item-button(item.key); }
+        }
+    }
+}
+
 export component SettingsWindow inherits Window {
     // ---- 数据（Rust 侧注入）----
     in-out property <[SettingsPage]> pages: [];
@@ -255,6 +377,14 @@ export component SettingsWindow inherits Window {
     in-out property <string> t-ddc-warning: "";
     in-out property <string> t-move-up: "";
     in-out property <string> t-move-down: "";
+    in-out property <string> t-all-displays: "";
+    in-out property <string> t-no-displays: "";
+    in-out property <string> t-minimum: "";
+    in-out property <string> t-maximum: "";
+    in-out property <string> t-calibration-point: "";
+    in-out property <string> t-delete: "";
+    in-out property <string> t-calibration-input: "";
+    in-out property <string> t-calibration-output: "";
 
     // ---- 回调（Rust 侧接线）----
     callback page-changed(string);
@@ -268,6 +398,12 @@ export component SettingsWindow inherits Window {
     callback monitor-extend-minimum(string, bool);
     callback monitor-breakpoint(string, int);
     callback monitor-moved(string, int);
+    // 亮度归一化：monitor id + "min"/"max" + 值
+    callback monitor-remap(string, string, float);
+    // 校准点：monitor id + 索引 + 字段（"input"/"output"）+ 值
+    callback calibration-changed(string, int, string, float);
+    callback calibration-added(string);
+    callback calibration-removed(string, int);
     callback hotkey-add;
     callback hotkey-remove(string);
     callback hotkey-record(string);
@@ -344,51 +480,82 @@ export component SettingsWindow inherits Window {
                         padding: 16px;
                         spacing: 4px;
 
-                        // 通用设置页（general / features / time / updates）
-                        if (root.active-page != "monitors" && root.active-page != "hotkeys") : VerticalLayout {
-                            spacing: 4px;
-                            for item in root.items : VerticalLayout {
-                                spacing: 0px;
-                                if (item.kind == SettingsItemKind.section) : Rectangle {
-                                    height: 34px;
-                                    background: transparent;
-                                    Text {
-                                        text: item.title;
-                                        font-size: 13px;
-                                        font-weight: 600;
-                                        color: Theme.text;
-                                        vertical-alignment: bottom;
-                                    }
-                                }
-                                if (item.kind == SettingsItemKind.note) : Text {
-                                    text: item.title;
-                                    font-size: 12px;
-                                    color: Theme.text-mid;
-                                    wrap: word-wrap;
-                                }
-                                if (item.kind != SettingsItemKind.section && item.kind != SettingsItemKind.note) : SettingsRow {
-                                    item: item;
-                                    toggle-changed(v) => { root.item-toggle(item.key, v); }
-                                    choice-picked(v) => { root.item-choice(item.key, v); }
-                                    button-clicked => { root.item-button(item.key); }
-                                }
-                            }
+                        // 通用设置页（general / features / time / updates / light-sensor / debug）
+                        if (root.active-page != "monitors" && root.active-page != "hotkeys") : SettingsItems {
+                            items: root.items;
+                            item-toggle(k, v) => { root.item-toggle(k, v); }
+                            item-choice(k, v) => { root.item-choice(k, v); }
+                            item-button(k) => { root.item-button(k); }
                         }
 
-                        // 显示器页（equiv monitors 页：重命名 / 隐藏 / 排序 / gamma / extend minimum / SDR）
+                        // 显示器页（equiv SettingsWindow.jsx L1527-L1578 的三段结构）
+                        //   1) All Displays：每台显示器的详情（getInfoMonitors）
+                        //   2) SettingsOption 序列：亮度更新率 / 隐藏内屏 / 睡眠动作 / 电源值 / 平衡亮度说明
+                        //   3) 逐台控制：重命名 / 隐藏 / 排序 / gamma / extend minimum / SDR
                         if (root.active-page == "monitors") : VerticalLayout {
                             spacing: 8px;
+
+                            // ---- 第 1 段：所有显示器（equiv getInfoMonitors L857-L887）----
+                            Rectangle {
+                                height: 34px;
+                                background: transparent;
+                                Text {
+                                    text: root.t-all-displays;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                    vertical-alignment: bottom;
+                                }
+                            }
+                            if (root.monitors.length == 0) : Text {
+                                text: root.t-no-displays;
+                                font-size: 12px;
+                                color: Theme.text-mid;
+                                wrap: word-wrap;
+                            }
                             for monitor in root.monitors : Rectangle {
-                                height: entry.preferred-height + 12px;
+                                height: info.preferred-height + 16px;
                                 border-radius: 4px;
                                 background: Theme.page-section-bg;
-                                entry := VerticalLayout {
+                                info := VerticalLayout {
                                     padding: 8px;
                                     spacing: 4px;
+                                    Text {
+                                        text: monitor.title;
+                                        font-size: 12px;
+                                        font-weight: 600;
+                                        color: Theme.text;
+                                        wrap: word-wrap;
+                                    }
+                                    Text {
+                                        text: monitor.details;
+                                        font-size: 11px;
+                                        color: Theme.text-mid;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+
+                            // ---- 第 2 段：全局设置项（equiv L1536-L1569）----
+                            SettingsItems {
+                                items: root.items;
+                                item-toggle(k, v) => { root.item-toggle(k, v); }
+                                item-choice(k, v) => { root.item-choice(k, v); }
+                                item-button(k) => { root.item-button(k); }
+                            }
+
+                            // ---- 第 3 段：逐台显示器控制（equiv hide/rename/reorder/gamma/extend/SDR）----
+                            for monitor in root.monitors : Rectangle {
+                                height: ctrl.preferred-height + 12px;
+                                border-radius: 4px;
+                                background: Theme.page-section-bg;
+                                ctrl := VerticalLayout {
+                                    padding: 8px;
+                                    spacing: 6px;
                                     HorizontalLayout {
-                                        spacing: 6px;
+                                        spacing: 4px;
                                         Text {
-                                            text: monitor.connection + " · " + monitor.name;
+                                            text: monitor.name;
                                             font-size: 12px;
                                             font-weight: 600;
                                             color: Theme.text;
@@ -396,57 +563,117 @@ export component SettingsWindow inherits Window {
                                             horizontal-stretch: 1;
                                             overflow: elide;
                                         }
-                                        Text { text: "\u{e70e}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: Theme.text-mid; vertical-alignment: center; }
-                                        TouchArea { clicked => { root.monitor-moved(monitor.key, -1); } }
-                                        Text { text: "\u{e70d}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: Theme.text-mid; vertical-alignment: center; }
-                                        TouchArea { clicked => { root.monitor-moved(monitor.key, 1); } }
-                                    }
-                                    Text {
-                                        text: monitor.brightness + " · HDR: " + monitor.hdr + " · " + monitor.normalization;
-                                        font-size: 11px;
-                                        color: Theme.text-mid;
-                                        wrap: word-wrap;
+                                        Rectangle {
+                                            width: 24px;
+                                            height: 22px;
+                                            border-radius: 4px;
+                                            background: up.has-hover ? Theme.button-bg : transparent;
+                                            Text { text: "\u{e70e}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: Theme.text-mid; vertical-alignment: center; horizontal-alignment: center; }
+                                            up := TouchArea { clicked => { root.monitor-moved(monitor.key, -1); } }
+                                        }
+                                        Rectangle {
+                                            width: 24px;
+                                            height: 22px;
+                                            border-radius: 4px;
+                                            background: down.has-hover ? Theme.button-bg : transparent;
+                                            Text { text: "\u{e70d}"; font-family: "Segoe MDL2 Assets"; font-size: 12px; color: Theme.text-mid; vertical-alignment: center; horizontal-alignment: center; }
+                                            down := TouchArea { clicked => { root.monitor-moved(monitor.key, 1); } }
+                                        }
                                     }
                                     HorizontalLayout {
-                                        spacing: 8px;
-                                        Rectangle {
-                                            height: 24px;
-                                            border-radius: 4px;
-                                            background: Theme.button-bg;
-                                            border-width: 1px;
-                                            border-color: Theme.button-border;
+                                        spacing: 6px;
+                                        Text { text: monitor.connection; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
+                                        LineEdit {
+                                            text: monitor.rename;
+                                            placeholder-text: root.t-monitors-rename;
                                             horizontal-stretch: 1;
-                                            LineEdit {
-                                                text: monitor.rename;
-                                                placeholder-text: root.t-monitors-rename;
-                                                accepted(t) => { root.monitor-renamed(monitor.key, t); }
-                                            }
+                                            accepted(t) => { root.monitor-renamed(monitor.key, t); }
                                         }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
                                         Text { text: root.t-monitors-hide; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
                                         Toggle { checked: monitor.hidden; toggled(v) => { root.monitor-hidden(monitor.key, v); } }
                                         Text { text: root.t-monitors-gamma; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
                                         Toggle { checked: monitor.gamma; toggled(v) => { root.monitor-gamma(monitor.key, v); } }
                                         Text { text: root.t-monitors-sdr; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
                                         Toggle { checked: monitor.sdr; toggled(v) => { root.monitor-sdr(monitor.key, v); } }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
                                     }
                                     HorizontalLayout {
-                                        spacing: 8px;
+                                        spacing: 6px;
                                         Text { text: root.t-monitors-extend-minimum; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
                                         Toggle { checked: monitor.extend-minimum; toggled(v) => { root.monitor-extend-minimum(monitor.key, v); } }
-                                        if (monitor.extend-minimum) : Rectangle {
+                                        if (monitor.extend-minimum) : LineEdit {
                                             width: 60px;
-                                            height: 24px;
-                                            border-radius: 4px;
-                                            background: Theme.button-bg;
-                                            border-width: 1px;
-                                            border-color: Theme.button-border;
-                                            LineEdit {
-                                                text: "\{monitor.breakpoint}";
-                                                horizontal-alignment: center;
-                                                accepted(t) => { root.monitor-breakpoint(monitor.key, t.to-float()); }
-                                            }
+                                            text: "\{monitor.breakpoint}";
+                                            horizontal-alignment: center;
+                                            accepted(t) => { root.monitor-breakpoint(monitor.key, t.to-float()); }
                                         }
                                         Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    }
+
+                                    // ---- 亮度归一化（equiv getMinMaxMonitors L465-L507 的 Min/Max 滑块）----
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.t-minimum; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; width: 40px; }
+                                        MiniSlider {
+                                            level: monitor.remap-min;
+                                            minimum: 0;
+                                            maximum: 100;
+                                            horizontal-stretch: 1;
+                                            changed(v) => { root.monitor-remap(monitor.id, "min", v); }
+                                        }
+                                        Text { text: "\{round(monitor.remap-min)}"; font-size: 11px; color: Theme.text; vertical-alignment: center; width: 28px; horizontal-alignment: right; }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.t-maximum; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; width: 40px; }
+                                        MiniSlider {
+                                            level: monitor.remap-max;
+                                            minimum: 0;
+                                            maximum: 100;
+                                            horizontal-stretch: 1;
+                                            changed(v) => { root.monitor-remap(monitor.id, "max", v); }
+                                        }
+                                        Text { text: "\{round(monitor.remap-max)}"; font-size: 11px; color: Theme.text; vertical-alignment: center; width: 28px; horizontal-alignment: right; }
+                                    }
+
+                                    // ---- 校准点（equiv getMonitorCalibration L509-L534）----
+                                    for point in monitor.calibration : HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: root.t-calibration-input; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
+                                        MiniSlider {
+                                            level: point.input;
+                                            horizontal-stretch: 1;
+                                            changed(v) => { root.calibration-changed(monitor.id, point.index, "input", v); }
+                                        }
+                                        Text { text: "\{round(point.input)}"; font-size: 11px; color: Theme.text; vertical-alignment: center; width: 28px; horizontal-alignment: right; }
+                                        Text { text: root.t-calibration-output; font-size: 11px; color: Theme.text-mid; vertical-alignment: center; }
+                                        MiniSlider {
+                                            level: point.output;
+                                            horizontal-stretch: 1;
+                                            changed(v) => { root.calibration-changed(monitor.id, point.index, "output", v); }
+                                        }
+                                        Text { text: "\{round(point.output)}"; font-size: 11px; color: Theme.text; vertical-alignment: center; width: 28px; horizontal-alignment: right; }
+                                        Rectangle {
+                                            width: 26px;
+                                            height: 20px;
+                                            border-radius: 4px;
+                                            background: del.has-hover ? Theme.button-bg : transparent;
+                                            Text { text: "\u{e74d}"; font-family: "Segoe MDL2 Assets"; font-size: 11px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                                            del := TouchArea { clicked => { root.calibration-removed(monitor.id, point.index); } }
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 24px;
+                                        width: 170px;
+                                        border-radius: 4px;
+                                        background: Theme.button-bg;
+                                        border-width: 1px;
+                                        border-color: Theme.button-border;
+                                        Text { text: "+ " + root.t-calibration-point; font-size: 11px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
+                                        TouchArea { clicked => { root.calibration-added(monitor.id); } }
                                     }
                                 }
                             }

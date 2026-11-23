@@ -163,6 +163,18 @@ impl ItemBuilder {
     }
 }
 
+/// JS 真值语义（equiv `!monitor.brightnessType` 的取反判定）。
+fn json_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map(|v| v != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(_) => true,
+    }
+}
+
 fn json_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -663,6 +675,8 @@ pub fn build_monitor_entries(monitors: &Value, settings: &Value) -> Vec<Settings
         .get("extendMinimumBreakpoints")
         .cloned()
         .unwrap_or(json!({}));
+    // 亮度归一化 remap（equiv settings.remaps；getRemap 先按 id 再按 name 回退）
+    let remaps = settings.get("remaps").cloned().unwrap_or(json!({}));
 
     monitor_view::sorted_monitors(monitors)
         .into_iter()
@@ -687,26 +701,100 @@ pub fn build_monitor_entries(monitors: &Value, settings: &Value) -> Vec<Settings
                     _ => "None".to_string(),
                 }
             };
-            let brightness = m
-                .get("brightness")
-                .and_then(|v| v.as_f64())
-                .map(|v| format!("{}%", v.round() as i64))
-                .unwrap_or_else(|| tt_localize::t("GENERIC_NOT_SUPPORTED"));
-            let maximum = m
-                .get("brightnessMax")
-                .and_then(|v| v.as_f64())
-                .map(|v| v.round().to_string())
-                .unwrap_or_else(|| tt_localize::t("GENERIC_NOT_SUPPORTED"));
-            let normalization = format!(
-                "{} - {}",
-                m.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64,
-                m.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0) as i64
-            );
+            // equiv getInfoMonitors L863-L881：displayLevel 只取整显示；不支持/探测失败分别为
+            // "Not supported" 与 "???"（JS 真值语义判断 brightnessType）
+            let brightness_type = m
+                .get("brightnessType")
+                .map(json_truthy)
+                .unwrap_or(false);
+            let not_supported = tt_localize::t("GENERIC_NOT_SUPPORTED");
+            let display_level = |v: Option<&Value>| match v.and_then(|v| v.as_f64()) {
+                Some(n) => format!("{}", n.round() as i64),
+                None => "???".to_string(),
+            };
+            let brightness = match type_str {
+                "none" => not_supported.clone(),
+                "ddcci" if !brightness_type => "???".to_string(),
+                _ => display_level(m.get("brightness")),
+            };
+            let maximum = match type_str {
+                "ddcci" | "software" => {
+                    if type_str == "ddcci" && !brightness_type {
+                        "???".to_string()
+                    } else {
+                        display_level(m.get("brightnessMax"))
+                    }
+                }
+                _ => not_supported.clone(),
+            };
+            let normalization = if type_str == "none" {
+                not_supported.clone()
+            } else {
+                format!(
+                    "{} - {}",
+                    m.get("min").and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i64,
+                    m.get("max").and_then(|v| v.as_f64()).unwrap_or(100.0).round() as i64
+                )
+            };
             let hdr = match m.get("hdr").and_then(|v| v.as_str()) {
                 Some("active") => tt_localize::t("GENERIC_ACTIVE"),
                 Some("supported") => tt_localize::t("GENERIC_SUPPORTED"),
                 _ => tt_localize::t("GENERIC_UNSUPPORTED"),
             };
+            // equiv getInfoMonitors 的 <p> 明细（Name / Internal Name / Communication /
+            // Current Brightness / Max Brightness / Brightness Normalization / HDR）
+            let internal_name = m
+                .get("hwid")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(1))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let display_name = monitor_view::settings_monitor_name(&m, &names);
+            let details = format!(
+                "{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}\n{}: {}",
+                tt_localize::t("SETTINGS_MONITORS_DETAILS_NAME"),
+                display_name,
+                tt_localize::t("SETTINGS_MONITORS_DETAILS_INTERNAL_NAME"),
+                internal_name,
+                tt_localize::t("SETTINGS_MONITORS_DETAILS_COMMUNICATION"),
+                connection,
+                tt_localize::t("SETTINGS_MONITORS_DETAILS_BRIGHTNESS"),
+                brightness,
+                tt_localize::t("SETTINGS_MONITORS_DETAILS_MAX_BRIGHTNESS"),
+                maximum,
+                tt_localize::t("SETTINGS_MONITORS_DETAILS_BRIGHTNESS_NORMALIZATION"),
+                normalization,
+                tt_localize::t("SETTINGS_MONITORS_DETAILS_HDR"),
+                hdr
+            );
+            let remap = remap_of(&remaps, &m);
+            // 校准点（equiv getMonitorCalibration L509-L534）：input 为滑块级别、output 为下发级别
+            let calibration = remap
+                .and_then(|r| r.get("calibration"))
+                .and_then(|v| v.as_array())
+                .map(|points| {
+                    points
+                        .iter()
+                        .enumerate()
+                        .map(|(index, point)| SettingsCalibrationPoint {
+                            index: index as i32,
+                            input: point.get("input").and_then(|v| v.as_f64()).unwrap_or(0.0)
+                                as f32,
+                            output: point.get("output").and_then(|v| v.as_f64()).unwrap_or(100.0)
+                                as f32,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let remap_min = remap
+                .and_then(|r| r.get("min"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0) as f32;
+            let remap_max = remap
+                .and_then(|r| r.get("max"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(100.0) as f32;
             SettingsMonitorEntry {
                 key: key.clone().into(),
                 id: id.clone().into(),
@@ -724,14 +812,35 @@ pub fn build_monitor_entries(monitors: &Value, settings: &Value) -> Vec<Settings
                     .get(&key)
                     .and_then(|v| v.as_i64())
                     .unwrap_or(20) as i32,
+                title: m
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .into(),
                 connection: connection.into(),
                 hdr: hdr.into(),
                 brightness: brightness.into(),
                 maximum: maximum.into(),
                 normalization: normalization.into(),
+                details: details.into(),
+                remap_min,
+                remap_max,
+                calibration: ModelRc::new(VecModel::from(calibration)),
             }
         })
         .collect()
+}
+
+/// getRemap（equiv SettingsWindow.jsx:L263-L273）：先按显示器 id，找不到再按 name 回退。
+fn remap_of<'a>(remaps: &'a Value, m: &Value) -> Option<&'a Value> {
+    let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(r) = remaps.get(id) {
+        if !r.is_null() {
+            return Some(r);
+        }
+    }
+    let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    remaps.get(name)
 }
 
 /// 热键列表（equiv settings.hotkeys 的 v1.16.0 格式）。
@@ -851,14 +960,62 @@ mod tests {
 
     #[test]
     fn monitor_entry_connection_labels() {
+        // equiv getInfoMonitors：ddcci 有 brightnessType 时显示读数，缺省则为 "???"
         let monitors = json!({
             "k1": {"key": "k1", "id": "\\\\.\\DISPLAY1", "name": "CMN1521", "type": "ddcci",
-                   "highLevelSupported": {"brightness": true}, "brightness": 60, "min": 0, "max": 100}
+                   "highLevelSupported": {"brightness": true}, "brightnessType": 1,
+                   "brightness": 60, "brightnessMax": 100, "min": 0, "max": 100,
+                   "hwid": ["MONITOR\\CMN1521", "CMN1521", "5&1&0&UID1"]}
         });
         let entries = build_monitor_entries(&monitors, &json!({}));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].connection, "DDC/CI HL");
-        assert_eq!(entries[0].brightness, "60%");
+        assert_eq!(entries[0].title, "CMN1521");
+        assert_eq!(entries[0].brightness, "60");
+        assert_eq!(entries[0].maximum, "100");
+        assert_eq!(entries[0].normalization, "0 - 100");
+        assert!(entries[0].details.contains("CMN1521"));
+        assert!(entries[0].details.contains("Current Brightness: 60"));
+    }
+
+    #[test]
+    fn monitor_entry_ddcci_without_brightness_type_shows_unknown() {
+        // equiv getInfoMonitors L866-L869：type=ddcci 且无 brightnessType -> "???"
+        let monitors = json!({
+            "k1": {"key": "k1", "id": "DISPLAY1", "name": "X", "type": "ddcci",
+                   "brightness": 60, "brightnessMax": 100, "min": 0, "max": 100}
+        });
+        let entries = build_monitor_entries(&monitors, &json!({}));
+        assert_eq!(entries[0].brightness, "???");
+        assert_eq!(entries[0].maximum, "???");
+    }
+
+    #[test]
+    fn monitor_entry_none_type_reports_not_supported() {
+        // equiv getInfoMonitors L878-L880：type=none 的三项均为 Not supported
+        let monitors = json!({
+            "k1": {"key": "k1", "id": "DISPLAY1", "name": "Ghost", "type": "none"}
+        });
+        let entries = build_monitor_entries(&monitors, &json!({}));
+        let not_supported = tt_localize::t("GENERIC_NOT_SUPPORTED");
+        assert_eq!(entries[0].brightness, not_supported);
+        assert_eq!(entries[0].maximum, not_supported);
+        assert_eq!(entries[0].normalization, not_supported);
+    }
+
+    #[test]
+    fn monitors_page_renders_all_display_items() {
+        // 原版 monitors 页的全局项（updateInterval / hideClosedLid / normalize 说明）
+        let items = build_items(
+            "monitors",
+            &json!({"updateInterval": 500, "hideClosedLid": true}),
+        );
+        let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
+        assert!(keys.contains(&"updateInterval"));
+        assert!(keys.contains(&"hideClosedLid"));
+        assert!(items
+            .iter()
+            .any(|i| i.kind == SettingsItemKind::Note && !i.title.is_empty()));
     }
 
     #[test]
