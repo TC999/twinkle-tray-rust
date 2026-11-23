@@ -362,16 +362,24 @@ fn start_tray(
         .map(|t| t == "dark")
         .unwrap_or(true);
     let dir = if dark { "dark" } else { "light" };
-    let candidates = [
-        exe_dir.join("assets").join("tray-icons").join(dir).join(format!("{}.ico", icon_name)),
-        exe_dir
-            .join("origin")
-            .join("src")
-            .join("assets")
-            .join("tray-icons")
-            .join(dir)
-            .join(format!("{}.ico", icon_name)),
-    ];
+    let file = format!("{}.ico", icon_name);
+    // 图标资产搜索链（AGENTS.md §1.2：加载预生成 ico，禁止自绘）：
+    // 1) exe 目录旁 assets/tray-icons（发布布局：assets 随 exe 部署）
+    // 2) exe 目录旁的 origin/src/assets（dev 运行 target/debug 时 exe_dir 是 target/debug）
+    // 3) 仓库根 origin/src/assets（exe_dir 向上回溯两级）
+    // 4) 当前工作目录的 origin/src/assets（任意 cwd 启动兜底）
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    candidates.push(exe_dir.join("assets").join("tray-icons").join(&dir).join(&file));
+    candidates.push(exe_dir.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
+    if let Some(parent) = exe_dir.parent() {
+        candidates.push(parent.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
+    }
+    if let Some(grand) = exe_dir.parent().and_then(|p| p.parent()) {
+        candidates.push(grand.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
+    }
     let icon_path = match candidates.iter().find(|p| p.exists()) {
         Some(p) => p.to_string_lossy().to_string(),
         None => {
@@ -379,15 +387,19 @@ fn start_tray(
             return (None, None);
         }
     };
+    logger::log_as("MAIN", "info", &format!("Tray icon: {}", icon_path));
     let config = tray::TrayConfig {
         icon_path,
         tooltip: "Twinkle Tray".to_string(),
         menu_items: build_tray_menu(),
     };
     // 托盘窗口/图标由专用线程创建与销毁（DestroyWindow 的同线程约束）
-    let events = tray::spawn_tray_thread(config);
+    let (events, handle) = tray::spawn_tray_thread(config);
+    if handle.is_none() {
+        logger::log_as("MAIN", "error", "Tray icon creation failed (Shell_NotifyIconW NIM_ADD).");
+    }
     logger::log_as("MAIN", "info", "Tray icon thread started.");
-    (None, Some(events))
+    (handle, Some(events))
 }
 
 /// 托盘右键菜单（equiv electron.js setTrayMenu L4627-L4698 的项集合，§1.2 自写 HMENU）。

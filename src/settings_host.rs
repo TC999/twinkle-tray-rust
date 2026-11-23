@@ -625,12 +625,20 @@ mod tests {
 
     #[test]
     fn schedule_write_settings_debounces() {
-        let dir = std::env::temp_dir().join("tt-settings-debounce-test");
+        // 用带进程号/时间戳的唯一目录，避免与其他测试共享同一路径
+        // （TT_SETTINGS_PATH 与 WRITE_DEBOUNCE 都是进程级共享状态）
+        let dir = std::env::temp_dir().join(format!(
+            "tt-settings-debounce-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("settings.json");
-        std::env::set_var("TT_SETTINGS_PATH", &file);
-        // 等待前序测试的防抖落盘线程完成（WRITE_DEBOUNCE 是进程级单例，
-        // 防抖标志未清时排期会被忽略——轮询等待标志清空）
+        // 先等待前序测试的防抖落盘线程完成，再强制清空标志——
+        // 若仅等待而不清空，残留排期会让本次 schedule 被静默忽略。
         let mut waited = 0;
         loop {
             let busy = WRITE_DEBOUNCE.lock().unwrap_or_else(|e| e.into_inner()).is_some();
@@ -640,6 +648,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
             waited += 1;
         }
+        // 清空残留防抖标志（等价"本测试独占该单例"的前置条件）
+        {
+            let mut st = WRITE_DEBOUNCE.lock().unwrap_or_else(|e| e.into_inner());
+            *st = None;
+        }
+        std::env::set_var("TT_SETTINGS_PATH", &file);
         let settings = Arc::new(Mutex::new(json!({"a": 1})));
         // 连续两次排期：防抖语义（第二次被忽略，只有一次落盘线程）
         schedule_write_settings(&settings);

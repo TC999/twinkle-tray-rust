@@ -73,6 +73,7 @@ pub enum TrayEvent {
 }
 
 /// 托盘图标句柄（含消息窗口）。
+#[derive(Clone, Copy)]
 pub struct TrayIconHandle {
     pub hwnd: HWND,
     pub uid: u32,
@@ -151,6 +152,10 @@ pub fn create_tray_icon(config: &TrayConfig) -> Option<TrayIconHandle> {
         let icon = load_icon(&config.icon_path)?;
 
         let mut nid = NOTIFYICONDATAW::default();
+        // cbSize: Shell_NotifyIconW 的 MSDN 硬性要求（结构体头字段必须为
+        // sizeof(NOTIFYICONDATAW)，否则 NIM_ADD 返回 FALSE）。Default 是 zeroed，
+        // 此处必须显式填充（windows 0.62 结构体无默认的 cbSize 初始化）。
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
         nid.uID = 1;
         nid.uFlags = NOTIFY_ICON_DATA_FLAGS(NIF_MESSAGE.0 | NIF_ICON.0 | NIF_TIP.0);
@@ -188,6 +193,8 @@ pub fn update_tray_icon(handle: &TrayIconHandle, icon_path: &str, tooltip: &str)
             return false;
         };
         let mut nid = NOTIFYICONDATAW::default();
+        // cbSize 同上：NIM_MODIFY 同样要求结构体头字段正确
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = handle.hwnd;
         nid.uID = handle.uid;
         nid.uFlags = NOTIFY_ICON_DATA_FLAGS(NIF_ICON.0 | NIF_TIP.0);
@@ -207,6 +214,7 @@ pub fn update_tray_icon(handle: &TrayIconHandle, icon_path: &str, tooltip: &str)
 pub fn remove_tray_icon(handle: &TrayIconHandle) {
     unsafe {
         let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = handle.hwnd;
         nid.uID = handle.uid;
         let _ = Shell_NotifyIconW(NOTIFY_ICON_MESSAGE(NIM_DELETE.0), &nid);
@@ -407,14 +415,19 @@ fn thread_id_slot() -> &'static Mutex<Option<u32>> {
 }
 
 /// 在专用线程创建托盘并跑消息循环（AGENTS.md §5）。
-/// 返回事件接收端。窗口与图标均由该线程创建并在退出时销毁（DestroyWindow 的
-/// 同线程约束），主线程只消费事件。
-pub fn spawn_tray_thread(config: TrayConfig) -> Receiver<TrayEvent> {
+/// 返回 (事件接收端, 图标句柄)。窗口与图标均由该线程创建并在退出时销毁
+/// （DestroyWindow 的同线程约束），主线程只消费事件。
+/// handle 供 update_tray_icon/remove_tray_icon 使用；创建失败时为 None
+/// （线程立即退出，不进入消息循环）。
+pub fn spawn_tray_thread(config: TrayConfig) -> (Receiver<TrayEvent>, Option<TrayIconHandle>) {
     let (tx, rx): (Sender<TrayEvent>, Receiver<TrayEvent>) = channel();
     let cb_tx = tx;
     set_tray_callback(Arc::new(move |event: TrayEvent| {
         let _ = cb_tx.send(event);
     }));
+    // HWND 是 *mut c_void（非 Send），跨线程传递转原始指针值 (usize, uid)
+    let handle_slot: Arc<Mutex<Option<(usize, u32)>>> = Arc::new(Mutex::new(None));
+    let handle_slot_t = handle_slot.clone();
     std::thread::spawn(move || {
         // 记录线程 id（退出时 PostThreadMessageW(WM_QUIT) 用）
         let current_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
@@ -424,11 +437,29 @@ pub fn spawn_tray_thread(config: TrayConfig) -> Receiver<TrayEvent> {
         let Some(handle) = create_tray_icon(&config) else {
             return;
         };
+        if let Ok(mut slot) = handle_slot_t.lock() {
+            *slot = Some((handle.hwnd.0 as usize, handle.uid));
+        }
         run_message_loop();
         // 消息循环退出后清理图标与窗口（同线程）
         remove_tray_icon(&handle);
     });
-    rx
+    // 等待图标创建完成（要么得到 handle，要么线程失败退出）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let handle = loop {
+        let got = handle_slot.lock().ok().and_then(|g| *g);
+        if let Some((hwnd, uid)) = got {
+            break Some(TrayIconHandle {
+                hwnd: HWND(hwnd as *mut core::ffi::c_void),
+                uid,
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    (rx, handle)
 }
 
 /// 停止托盘线程（equiv tray.destroy()）：投递 WM_QUIT 让消息循环返回。
@@ -492,5 +523,19 @@ mod tests {
             }
         }
         assert_eq!(rx.try_recv().unwrap(), TrayEvent::Menu(7));
+    }
+
+    /// 回归：NOTIFYICONDATAW::default() 是 zeroed()，cbSize 必须显式填充。
+    /// Shell_NotifyIconW 要求 cbSize == sizeof(NOTIFYICONDATAW)，否则 NIM_ADD
+    /// 恒返回 FALSE（真机缺陷：托盘图标永不出现，且无任何错误日志）。
+    #[test]
+    fn notify_icon_data_cbsize_is_required() {
+        let nid = NOTIFYICONDATAW::default();
+        assert_eq!(nid.cbSize, 0, "Default 是 zeroed，cbSize 为 0——必须显式赋值");
+        // 赋值后必须等于结构体大小（Shell_NotifyIconW 的硬性校验）
+        let mut filled = NOTIFYICONDATAW::default();
+        filled.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        assert_eq!(filled.cbSize, std::mem::size_of::<NOTIFYICONDATAW>() as u32);
+        assert!(filled.cbSize >= 88, "x64 NOTIFYICONDATAW 至少 88 字节");
     }
 }

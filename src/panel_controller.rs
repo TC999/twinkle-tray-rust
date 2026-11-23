@@ -1205,19 +1205,57 @@ fn default_panel_position(ui: &crate::PanelWindow) -> slint::PhysicalPosition {
     if let Some(g) = settings.get("overrideTaskbarGap").and_then(|v| v.as_i64()) {
         gap = g as i32;
     }
+    // Slint 的 window().set_position 走 winit 的 LogicalPosition 语义：
+    // 传物理坐标会被再乘一次 scale_factor，导致 DPI≠100% 时窗口跑到屏幕外
+    // （真机缺陷：120 DPI 下面板落在 1940,1123 而屏幕仅 1920x1080）。
+    // 因此这里统一用逻辑像素（equiv Electron 的 DIP 坐标）计算。
     let size = ui.window().size();
-    let screen_w = 1920;
-    let screen_h = 1080;
     let scale = ui.window().scale_factor();
-    let w = (size.width as f32 / scale) as i32;
-    let h = (size.height as f32 / scale) as i32;
+    let w = (size.width as f32 / scale).round() as i32;
+    let h = (size.height as f32 / scale).round() as i32;
+    // equiv screen.getPrimaryDisplay().workAreaSize（electron.js:L4065-L4118 的定位基准）：
+    // 读真实主屏工作区，不再硬编码 1920x1080。
+    // SPI_GETWORKAREA 在 DPI-aware 进程下返回物理像素，需换算到逻辑像素
+    // 才能与 w/h（逻辑）同口径计算。
+    let (work_w_phys, work_h_phys) = primary_work_area_physical().unwrap_or((1920, 1030));
+    let work_w = (work_w_phys as f32 / scale).round() as i32;
+    let work_h = (work_h_phys as f32 / scale).round() as i32;
     let (x, y) = match position {
-        "TOP" => (screen_w - w - gap, gap),
-        "LEFT" => (gap, screen_h - h - gap),
-        "RIGHT" => (screen_w - w - gap, screen_h - h - gap),
-        _ => (screen_w - w - gap, screen_h - h - gap),
+        "TOP" => (work_w - w - gap, gap),
+        "LEFT" => (gap, work_h - h - gap),
+        "RIGHT" => (work_w - w - gap, work_h - h - gap),
+        _ => (work_w - w - gap, work_h - h - gap),
     };
-    slint::PhysicalPosition::new((x as f32 * scale) as i32, (y as f32 * scale) as i32)
+    // set_position 需要 PhysicalPosition：逻辑坐标 × scale_factor 换算回物理像素。
+    // （此前直接把"逻辑值当物理值"传入，DPI≠100% 时窗口落到屏幕外。）
+    slint::PhysicalPosition::new(
+        (x.max(0) as f32 * scale) as i32,
+        (y.max(0) as f32 * scale) as i32,
+    )
+}
+
+/// 主屏工作区（物理像素）。equiv Electron screen.getPrimaryDisplay().workAreaSize。
+/// 用 SystemParametersInfoW(SPI_GETWORKAREA)（已扣除任务栏）。DPI-aware 进程下
+/// 返回物理像素，调用方需按 scale_factor 换算到逻辑口径。
+fn primary_work_area_physical() -> Option<(i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
+    use windows::Win32::Foundation::RECT;
+    // SAFETY: SPI_GETWORKAREA 只写 RECT（由系统填充），指针有效且生命周期覆盖调用。
+    unsafe {
+        let mut rect = RECT::default();
+        let ok = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rect as *mut RECT as *mut core::ffi::c_void),
+            Default::default(),
+        );
+        if ok.is_err() {
+            return None;
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if w > 0 && h > 0 { Some((w, h)) } else { None }
+    }
 }
 
 // 面板定位用 settings 快照（run_panel_controller 安装；thread_local 等价单线程语义）

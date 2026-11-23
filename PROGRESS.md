@@ -342,3 +342,69 @@ ui-smoke: settings pages: 8 / page debug -> 36 items
 22. **debug 页按钮** refresh-monitors/clear-cache 接入 handle_settings_button（flushvcp 命令已在 COMMANDS_MUTATE_WORKER_STATE 集合）。
 
 **质量状态（Round 8）**：cargo build --workspace 零错误零警告；cargo test --workspace 110 个测试全部通过；--udp-smoke/--ui-smoke/--app-smoke 真机对拍通过
+
+## Round 9 · 2026-11-23：修复「启动后托盘图标不出现」
+
+### 症状
+
+程序启动后任务栏通知区**没有任何图标**，托盘完全不可用（左键/右键/菜单全部失效）。
+日志仅一行 `[MAIN:ERR] Tray icon asset not found.`，之后 `Tray window unavailable; hotkeys not registered.`。
+
+### 根因（三处叠加）
+
+| # | 缺陷 | 位置 | 后果 |
+|---|---|---|---|
+| 1 | **图标资产路径解析失败** | `src/main.rs start_tray` | 只查 `exe_dir/assets/tray-icons/...`，而 dev 运行时 exe 在 `target/debug/`，资产在仓库根 `origin/src/assets/`。找不到 → `return (None, None)` → **托盘线程根本没启动**，热键也随之失效 |
+| 2 | **NOTIFYICONDATAW.cbSize 恒为 0** | `crates/tray/src/tray_icon.rs` | windows 0.62 的 `Default` 是 `core::mem::zeroed()`，`cbSize` 默认 0。`Shell_NotifyIconW` 要求 `cbSize == sizeof(NOTIFYICONDATAW)`，否则 NIM_ADD **静默返回 FALSE**（无错误码、无日志） |
+| 3 | **面板定位在 DPI≠100% 时跑到屏幕外** | `src/panel_controller.rs default_panel_position` | 硬编码 `1920x1080` 且逻辑/物理像素口径混用。真机 125% 缩放下面板落在 `1940,1123`，超出 1920×1080 屏幕 → 点托盘后面板"弹出"但用户看不见 |
+
+### 修复
+
+1. **图标搜索链**（`main.rs`）：按优先级尝试 5 个候选路径——exe 旁 `assets/`（发布布局）、exe 旁 `origin/src/assets/`、exe 上两级仓库根、当前工作目录的 `origin/src/assets/`。失败时记录已搜索的全部路径（便于现场诊断）。
+2. **cbSize 显式填充**（`tray_icon.rs`）：NIM_ADD / NIM_MODIFY / NIM_DELETE 三处均设置
+   `nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32`，并附 MSDN 依据注释。
+3. **面板定位**（`panel_controller.rs`）：改用 `SystemParametersInfoW(SPI_GETWORKAREA)` 读真实工作区（自动扣除任务栏），统一换算到逻辑像素计算后乘 `scale_factor` 返回 `PhysicalPosition`；新增 `Win32_UI_HiDpi` feature 用于 `GetDpiForSystem`。
+
+### 附带修复
+
+- `spawn_tray_thread` 返回值由 `Receiver<TrayEvent>` 改为 `(Receiver<TrayEvent>, Option<TrayIconHandle>)`：
+  主线程现在能拿到图标句柄（供 `update_tray_icon` 主题切换），并在 NIM_ADD 失败时明确记录错误。
+  HWND 非 Send，跨线程以 `(usize, u32)` 传递后重建；`TrayIconHandle` 派生 `Clone, Copy`。
+- `settings_host::schedule_write_settings_debounces` 测试隔离：改用带进程号+纳秒的唯一临时目录，
+  并在排期前强制清空残留的 `WRITE_DEBOUNCE` 单例（此前与其他测试共享 `TT_SETTINGS_PATH` 会偶发失败）。
+
+### 真机对拍（2026-11-23 · 1920×1080 @ 125% DPI，Win11）
+
+```
+# 修复前
+[MAIN:ERR] Tray icon asset not found.
+[MAIN:WAR] Tray window unavailable; hotkeys not registered.
+→ 任务栏无图标，Shell_NotifyIconGetRect 无法查到窗口
+
+# 修复后
+[MAIN] Tray icon: G:\...\origin\src\assets\tray-icons\light\icon.ico
+[MAIN] Tray icon thread started.
+Hotkeys registered: 0/0
+
+Shell_NotifyIconGetRect → HRESULT=0x00000000 (S_OK)
+  icon rect: 1558,1030,1588,1080     ← 在任务栏通知区内，30×50 标准尺寸
+  像素采样: maxLum=249（明亮图标像素已绘制）
+左键点击（PostMessage WM_TRAY_ICON/WM_LBUTTONUP）
+  → 面板 '调整亮度' rect=1460,866,445,148  inside_screen=True
+```
+
+面板定位修复前后对比：
+
+| | 位置 | 是否在屏幕内 |
+|---|---|---|
+| 修复前 | 1940,1123 | ❌ 超出 1920×1080 |
+| 修复后 | 1460,866 | ✅ 右下角贴任务栏 |
+
+### 回归测试
+
+新增 `tray_icon::tests::notify_icon_data_cbsize_is_required`：
+断言 `NOTIFYICONDATAW::default().cbSize == 0`（记录 zeroed 语义），并验证显式赋值后等于
+`size_of::<NOTIFYICONDATAW>()`、x64 下 ≥ 88 字节——防止该字段再被遗漏。
+
+**质量状态（Round 9）**：cargo build --workspace 零错误零警告；cargo test --workspace **111 个测试全部通过**；
+真机 e2e（图标可见性 + 点击弹出面板 + 面板定位）通过。
