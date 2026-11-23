@@ -31,3 +31,6 @@ crates/*/Cargo.lock
 
 # Windows 系统组件按字面量 %SystemDrive% 创建的缓存目录（构建/测试副产物）
 %SystemDrive%/
+
+# AI 助手的工作区记忆（本地数据，不入库）
+.workbuddy/
