@@ -466,6 +466,12 @@ pub fn shared_throttle() -> &'static Mutex<crate::panel_controller::BrightnessTh
     SHARED_THROTTLE.get_or_init(|| Mutex::new(crate::panel_controller::BrightnessThrottle::new()))
 }
 
+/// 在共享节流锁上执行操作（等价原版 updateBrightnessThrottle 的模块级单例访问）。
+pub fn with_shared_throttle<R>(f: impl FnOnce(&mut crate::panel_controller::BrightnessThrottle) -> R) -> Option<R> {
+    let mut guard = shared_throttle().lock().ok()?;
+    Some(f(&mut guard))
+}
+
 fn forwarded_slot() -> &'static Mutex<Vec<tray::TrayEvent>> {
     FORWARDED_EVENTS.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -600,7 +606,38 @@ impl SystemEvents {
                             handle_power_setting(rt, &name, &guid, data);
                         }
                     }
-                    tray::TrayEvent::PowerBroadcast(_) => {}
+                    tray::TrayEvent::PowerBroadcast(wparam) => {
+                        // equiv L5319-L5360 powerMonitor.on("resume")：
+                        // PBT_APMRESUMEAUTOMATIC(0x12)/PBT_APMRESUMESUSPENDED(0x7) 触发恢复链
+                        const PBT_APMRESUMEAUTOMATIC: u32 = 0x12;
+                        const PBT_APMRESUMESUSPENDED: u32 = 0x7;
+                        if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPENDED {
+                            println!("Resuming......");
+                            rt.recently_woke_up.store(true, Ordering::SeqCst);
+                            rt.resume_recovery_in_progress.store(true, Ordering::SeqCst);
+                            rt.resume_recovery_handled.store(false, Ordering::SeqCst);
+                            let settings = rt.settings_snapshot();
+                            // restartOnWake：整个 app 重启（equiv L5339-L5345）
+                            if settings.get("restartOnWake").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                println!("restartOnWake: relaunching app.");
+                                let exe = std::env::current_exe().unwrap_or_default();
+                                let _ = std::process::Command::new(exe).spawn();
+                                // 等价 app.exit()：退出事件循环（托盘线程随后清理）
+                                std::process::exit(0);
+                            }
+                            // 等价 L5347-L5360：停 worker → 带 allowWhileWindowsIdle 重启
+                            rt.host.manager.set_quitting(true);
+                            rt.host.manager.stop();
+                            rt.host.start(true);
+                            // 恢复恢复链完成（equiv L5362+ 的恢复逻辑由 refresh 链接管）
+                            rt.resume_recovery_in_progress.store(false, Ordering::SeqCst);
+                            rt.resume_recovery_handled.store(true, Ordering::SeqCst);
+                            // equiv L5462：unlock-screen 的 disableAutoRefresh 条件
+                            if !settings.get("disableAutoRefresh").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                handle_metrics_change(rt, "resume");
+                            }
+                        }
+                    }
                     tray::TrayEvent::ScMonitorPower => {
                         // equiv L3964-L3975:useScMonitorPowerEvent 开关(原版只打日志)
                         let settings = rt.settings_snapshot();

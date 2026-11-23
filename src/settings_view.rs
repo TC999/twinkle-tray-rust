@@ -20,6 +20,8 @@ pub fn build_pages() -> Vec<SettingsPage> {
         page("hotkeys", "SETTINGS_SIDEBAR_HOTKEYS", "\u{e765}"),
         page("light-sensor", "SETTINGS_SIDEBAR_LIGHT_SENSOR", "\u{e706}"),
         page("updates", "SETTINGS_SIDEBAR_UPDATES", "\u{e895}"),
+        // debug 页（equiv getSidebar L398-L403：label "Debug"，原版无本地化键，照抄硬编码）
+        page("debug", "SETTINGS_SIDEBAR_DEBUG", "\u{ebe8}"),
     ]
 }
 
@@ -195,9 +197,101 @@ pub fn build_items(page_id: &str, settings: &Value) -> Vec<SettingsItem> {
         "hotkeys" => hotkeys_page(&mut b, settings),
         "light-sensor" => light_sensor_page(&mut b, settings),
         "updates" => updates_page(&mut b, settings),
+        "debug" => debug_page(&mut b, settings),
         _ => {}
     }
     b.finish()
+}
+
+/// 调试页（equiv SettingsWindow.jsx L1722-L1798 的 pageSection debug 两段）。
+/// 原版各设置项硬编码英文标题；此处走 FTL 回退链（en.ftl 提供，行为一致）。
+fn debug_page(b: &mut ItemBuilder, s: &Value) {
+    // ---- All Displays（equiv L1723-L1725：Refresh Monitors / Clear Cache 按钮）----
+    b.section(&tt_localize::t("SETTINGS_DEBUG_ALL_DISPLAYS"));
+    b.button(
+        "refresh-monitors",
+        "SETTINGS_DEBUG_REFRESH_MONITORS",
+        "",
+        "SETTINGS_DEBUG_REFRESH_MONITORS",
+    );
+    b.button(
+        "clear-cache",
+        "SETTINGS_DEBUG_CLEAR_CACHE",
+        "",
+        "SETTINGS_DEBUG_CLEAR_CACHE",
+    );
+
+    // ---- Save Report（equiv L1727）----
+    b.button(
+        "save-report",
+        "SETTINGS_DEBUG_SAVE_REPORT",
+        "SETTINGS_DEBUG_SAVE_REPORT_DESC",
+        "SETTINGS_DEBUG_GENERATE_REPORT",
+    );
+
+    // ---- Settings 文件（equiv L1729-L1733：路径显示 + Open Settings 按钮）----
+    let settings_path = std::env::var("TT_SETTINGS_PATH").unwrap_or_default();
+    b.note(&format!("{}: {}", tt_localize::t("SETTINGS_DEBUG_SETTINGS"), settings_path));
+    b.button(
+        "open-settings-file",
+        "SETTINGS_DEBUG_OPEN_SETTINGS",
+        "",
+        "SETTINGS_DEBUG_OPEN_SETTINGS",
+    );
+
+    // ---- Raw Monitor Data（equiv L1735-L1739：JSON 文本展示）----
+    b.section(&tt_localize::t("SETTINGS_DEBUG_RAW_MONITOR_DATA"));
+
+    // ---- Other（equiv L1742-L1798 的开关/数值/下拉区）----
+    b.section(&tt_localize::t("SETTINGS_DEBUG_OTHER"));
+    b.toggle("isDev", "SETTINGS_DEBUG_DEV_MODE", "", s);
+    // UDP Server 组（equiv L1746-L1752）
+    b.toggle("udpEnabled", "SETTINGS_DEBUG_UDP_ENABLE", "", s);
+    b.toggle("udpRemote", "SETTINGS_DEBUG_UDP_REMOTE", "", s);
+    b.number("udpPortStart", "SETTINGS_DEBUG_UDP_PORT", "", s);
+    // Active port / UDP key 只读展示（equiv L1750-L1751 的 SettingsChild 无 input）
+    let active_port = s.get("udpPortActive").map(json_to_string).unwrap_or_default();
+    let udp_key = s.get("udpKey").map(json_to_string).unwrap_or_default();
+    b.note(&tt_localize::t("SETTINGS_DEBUG_UDP_ACTIVE").replace("{{1}}", &active_port));
+    b.note(&tt_localize::t("SETTINGS_DEBUG_UDP_KEY").replace("{{1}}", &udp_key));
+    // DDC/CI Scanning Mode（equiv L1754-L1764 下拉）
+    b.select(
+        "preferredDDCCIMethod",
+        "SETTINGS_DEBUG_DDC_SCAN",
+        "",
+        s,
+        &[
+            ("auto", tt_localize::t("SETTINGS_DEBUG_DDC_AUTO")),
+            ("fast", tt_localize::t("SETTINGS_DEBUG_DDC_FAST")),
+            ("accurate", tt_localize::t("SETTINGS_DEBUG_DDC_ACCURATE")),
+            ("no-validation", tt_localize::t("SETTINGS_DEBUG_DDC_NO_VALIDATION")),
+            ("legacy", tt_localize::t("SETTINGS_DEBUG_DDC_LEGACY")),
+        ],
+    );
+    let last_method = s.get("lastDetectedDDCCIMethod").map(json_to_string).unwrap_or_default();
+    b.note(&tt_localize::t("SETTINGS_DEBUG_DDC_SCAN_DESC").replace("{{1}}", &last_method));
+    // 恢复/延迟数值（equiv L1774-L1782）
+    b.number("idleRestoreSeconds", "SETTINGS_DEBUG_IDLE_RESTORE", "SETTINGS_DEBUG_IDLE_RESTORE_DESC", s);
+    b.number("wakeRestoreSeconds", "SETTINGS_DEBUG_WAKE_RESTORE", "SETTINGS_DEBUG_WAKE_RESTORE_DESC", s);
+    b.number("hardwareRestoreSeconds", "SETTINGS_DEBUG_HW_RESTORE", "SETTINGS_DEBUG_HW_RESTORE_DESC", s);
+    b.number("checkVCPWaitMS", "SETTINGS_DEBUG_VCP_DELAY", "SETTINGS_DEBUG_VCP_DELAY_DESC", s);
+    b.number("scrollFlyoutAmount", "SETTINGS_DEBUG_SCROLL_FLYOUT", "SETTINGS_DEBUG_SCROLL_FLYOUT_DESC", s);
+    // 开关区（equiv L1784-L1798）
+    b.toggle("disableThemeChanges", "SETTINGS_DEBUG_DISABLE_THEME", "SETTINGS_DEBUG_DISABLE_THEME_DESC", s);
+    b.toggle("restartOnWake", "SETTINGS_DEBUG_RESTART_WAKE", "", s);
+    b.toggle("disableAutoRefresh", "SETTINGS_DEBUG_DISABLE_AUTO_REFRESH", "SETTINGS_DEBUG_DISABLE_AUTO_REFRESH_DESC", s);
+    b.toggle("useWin32Event", "SETTINGS_DEBUG_USE_WIN32", "", s);
+    b.toggle("useElectronEvents", "SETTINGS_DEBUG_USE_ELECTRON", "", s);
+    b.toggle("useWmDisplayChangeEvent", "SETTINGS_DEBUG_USE_WM_DISPLAYCHANGE", "", s);
+    b.toggle("useScMonitorPowerEvent", "SETTINGS_DEBUG_USE_SC_MONITORPOWER", "", s);
+    b.toggle("useGuidPresenceEvent", "SETTINGS_DEBUG_USE_GUID_PRESENCE", "", s);
+    b.toggle("useGuidBrightnessEvent", "SETTINGS_DEBUG_USE_GUID_BRIGHTNESS", "", s);
+    b.toggle("reloadTray", "SETTINGS_DEBUG_RELOAD_TRAY", "", s);
+    b.toggle("reloadFlyout", "SETTINGS_DEBUG_RELOAD_FLYOUT", "", s);
+    b.toggle("logging", "SETTINGS_DEBUG_LOGGING", "SETTINGS_DEBUG_LOGGING_DESC", s);
+    b.toggle("showConsole", "SETTINGS_DEBUG_SHOW_CONSOLE", "", s);
+    b.toggle("useTaskbarRegistry", "SETTINGS_DEBUG_TASKBAR_REGISTRY", "", s);
+    b.toggle("disableMouseEvents", "SETTINGS_DEBUG_DISABLE_MOUSE", "", s);
 }
 
 /// 通用页（equiv SettingsWindow.jsx L1353-L1461）。
@@ -698,7 +792,7 @@ mod tests {
         let ids: Vec<&str> = pages.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["general", "monitors", "features", "time", "hotkeys", "light-sensor", "updates"]
+            vec!["general", "monitors", "features", "time", "hotkeys", "light-sensor", "updates", "debug"]
         );
     }
 

@@ -303,3 +303,42 @@ node tools/convert-localization.mjs --check
   beta 分支找到 v1.18.0-beta2（current 同版本不显示，等价 L5054）/ master 跳过 prerelease 无更新
 
 **质量状态（Round 7）**：cargo build --workspace 零错误零警告；cargo test --workspace 104 个测试全部通过
+
+
+## Round 8 · 2026-11-23：设置落盘 + UDP 服务器 + debug 页 + 运行时开关补全
+
+### 审计发现与修复（对照 origin 逐键审计 99 个 defaultSettings 键）
+
+| 缺项 | 源位置 | 修复 |
+|---|---|---|
+| **settings 磁盘落盘完全缺失**（update_setting 只写内存） | electron.js:L1221-L1237 writeSettings（333ms 防抖） | `monitor-thread-manager::write_settings_file`（tab 缩进序列化，等价 JSON.stringify(settings,null,'\t')）+ `settings_host::schedule_write_settings`（333ms 防抖单例，等价 writeSettingsTimeout 语义）；update_setting/reset-settings 两条路径均接线 |
+| **TT_SETTINGS_PATH 被读取但从未设置**（Open Settings 按钮失效） | — | main.rs 启动时 set_var |
+| **UDP 服务器完全缺失** | electron.js:L6145-L6371 | `src/udp_host.rs`：handleClientMessage（list/get/set/setvcp/checktime/refresh + udpKey 校验 + findMonitor 子串匹配 + determineVCP 映射）+ udp.start（端口候选 [base,base+13137,base+1603] 逐候选降级 + udpRemote 绑定域 + udpPortActive 写回）+ udp.stop；WinSock 直调（白名单内）；收包线程 + RT_SLOT 模块级单例等价原版闭包引用 |
+| **设置页缺 debug 页**（原版 8 页，Rust 7 页） | SettingsWindow.jsx:L1719-L1798 | settings_view `debug_page` 36 项：Refresh/Clear Cache/Save Report/Open Settings + Other 区全部开关（isDev/UDP 四键/preferredDDCCIMethod 下拉/恢复秒数三键/checkVCPWaitMS/scrollFlyoutAmount/事件源开关 6 键/reloadTray/reloadFlyout/logging/showConsole/useTaskbarRegistry/disableMouseEvents）；en.ftl +52 键（原版硬编码英文，走 FTL 回退链行为一致） |
+| **resume 恢复链未接**（PowerBroadcast 空分支） | electron.js:L5319-L5360 + L5462 | PBT_APMRESUMEAUTOMATIC/RESUMESUSPENDED → recentlyWokeUp/resume_recovery 标志 + restartOnWake 整机重启分支（等价 app.relaunch/exit）+ worker 重启（manager.stop/start(true)）+ disableAutoRefresh 条件保留 |
+| **killWhenIdle 无运行时引用** | electron.js:L3684-L3688 | 面板隐藏分支接线；Slint 无窗口销毁 API，以隐藏降级（差异记录） |
+| **useNativeAnimation 无运行时引用** | electron.js:L4333-L4340/L3694 | apply_window_material Win10 分支：false 时退化为无材质（tryVibrancy(false) 等价） |
+| **overrideTaskbarPosition/Gap 无运行时引用** | electron.js:L4105-L4115 | default_panel_position 接线（BOTTOM 假定 + gap 12 的既有降级保留，override 键原样支持） |
+
+### 真机对拍（2026-11-23）
+
+```
+# UDP（--udp-smoke：启动 → list → refresh → get → 错误 key → stop）
+udp_start: true / listening 127.0.0.1:14715
+list: OK (monitors JSON) → refresh 后 monitors: 1
+get brightness: 64.0（findMonitor "UID" 子串命中内屏 hwid2）
+bad key: no response（udpKey 校验正确拒绝）
+# settings 落盘
+write_settings_file tab 缩进 + 读回等价（单测）；update_setting → 333ms 防抖落盘（单测）
+# UI
+ui-smoke: settings pages: 8 / page debug -> 36 items
+```
+
+### 关键实现记录（Round 8）
+
+19. **monitors 的键是 hwid[2]**（instance name 第 3 段如 `5&xxx&0&UID440`，不含厂商名）——UDP findMonitor 的搜索串应传键子串（如 "UID"），与原版 Object.keys(monitors) 行为一致。
+20. **udp_port_active 写回后立即 schedule_write_settings**（等价原版 writeSettings 在 listening 回调里的调用）。
+21. **resume 链的 worker 重启**用 manager.stop→start(true)（allowWhileWindowsIdle 等价）；restartOnWake 分支等价 app.relaunch+exit（spawn 自身 + exit(0)）。
+22. **debug 页按钮** refresh-monitors/clear-cache 接入 handle_settings_button（flushvcp 命令已在 COMMANDS_MUTATE_WORKER_STATE 集合）。
+
+**质量状态（Round 8）**：cargo build --workspace 零错误零警告；cargo test --workspace 110 个测试全部通过；--udp-smoke/--ui-smoke/--app-smoke 真机对拍通过

@@ -7,6 +7,111 @@
 //! 1. 解析开关；2. 解析路径并建配置目录；3. 读 settings + 版本迁移；
 //! 4. 初始化会话日志；5. 拉起 monitor worker；6. 托盘/热键；7. 进入 Slint 事件循环。
 
+
+/// --udp-smoke：UDP 服务器真机对拍。
+/// 启动服务器 → 以 UDP 客户端发送 list/get/setvcp 消息 → 校验响应。
+fn run_udp_smoke(
+    host: &Arc<MonitorHost>,
+    settings: &serde_json::Value,
+    _paths: &AppPaths,
+) {
+    use std::net::UdpSocket;
+
+    println!("=== udp-smoke ===");
+    // 构造测试 settings：启用 UDP + 固定端口/密钥
+    let mut test_settings = settings.clone();
+    let obj = test_settings.as_object_mut().unwrap();
+    obj.insert("udpEnabled".to_string(), serde_json::json!(true));
+    obj.insert("udpPortStart".to_string(), serde_json::json!(14715));
+    obj.insert("udpKey".to_string(), serde_json::json!("smoke-test-key"));
+    let shared = Arc::new(Mutex::new(test_settings.clone()));
+
+    // 启动（等价 udp.start）
+    let rt_for_udp = twinkle_tray_rust::runtime_hosts::RuntimeHost::new(
+        host.clone(),
+        shared.clone(),
+        _paths.known_displays_path.clone(),
+    );
+    let started = twinkle_tray_rust::udp_host::udp_start(&rt_for_udp, &shared);
+    println!("udp_start: {}", started);
+
+    // 等待绑定
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    // UDP 客户端发包（等价外部控制器）
+    let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
+    client.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+
+    let send_recv = |msg: &str| -> Option<String> {
+        client
+            .send_to(msg.as_bytes(), "127.0.0.1:14715")
+            .expect("send");
+        let mut buf = [0u8; 65536];
+        match client.recv_from(&mut buf) {
+            Ok((n, _)) => Some(String::from_utf8_lossy(&buf[..n]).to_string()),
+            Err(e) => {
+                println!("recv error: {}", e);
+                None
+            }
+        }
+    };
+
+    // 1) list（须带 key；等价 handleClientMessage 的 key 校验）
+    let list_msg = serde_json::json!({"type": "list", "key": "smoke-test-key"}).to_string();
+    match send_recv(&list_msg) {
+        Some(resp) => {
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&resp);
+            match parsed {
+                Ok(v) => println!("list: OK ({} monitors)", v.as_object().map(|o| o.len()).unwrap_or(0)),
+                Err(_) => println!("list: NON-JSON response: {}", &resp[..resp.len().min(80)]),
+            }
+        }
+        None => println!("list: NO RESPONSE"),
+    }
+
+    // 1b) refresh：先触发显示器枚举（等价 refreshMonitors(true,true)）
+    let refresh_msg = serde_json::json!({"type": "refresh", "key": "smoke-test-key"}).to_string();
+    client.send_to(refresh_msg.as_bytes(), "127.0.0.1:14715").expect("send refresh");
+    // 轮询等待枚举完成（真机 WMI/DDC 扫描；上限 30s）
+    let mut polled = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        polled += 1;
+        let n = rt_for_udp.host.monitors_snapshot().as_object().map(|o| o.len()).unwrap_or(0);
+        if n > 0 || polled >= 60 {
+            println!("monitors after refresh: {} (poll {})", n, polled);
+            // 打印键名（对拍 findMonitor 的子串匹配）
+            let snap = rt_for_udp.host.monitors_snapshot();
+            let _ = snap;
+            break;
+        }
+    }
+
+    // 2) get brightness：monitor 参数 = monitors 键的子串（原版 findMonitor 语义）。
+    // 内屏键为 hwid[2] 形式（如 5&xxx&0&UID440），用 "UID" 子串匹配。
+    let get_msg = serde_json::json!({
+        "type": "get", "key": "smoke-test-key",
+        "monitor": "UID", "property": "brightness"
+    }).to_string();
+    match send_recv(&get_msg) {
+        Some(resp) => println!("get brightness: {}", resp),
+        None => println!("get brightness: NO RESPONSE"),
+    }
+
+    // 3) 错误 key：应无响应（recv 超时）
+    let bad_msg = serde_json::json!({"type": "list", "key": "WRONG"}).to_string();
+    client.send_to(bad_msg.as_bytes(), "127.0.0.1:14715").expect("send bad");
+    let mut buf = [0u8; 65536];
+    match client.recv_from(&mut buf) {
+        Ok(_) => println!("bad key: GOT RESPONSE (unexpected!)"),
+        Err(_) => println!("bad key: no response (correct)"),
+    }
+
+    // 4) stop
+    twinkle_tray_rust::udp_host::udp_stop();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    println!("udp stopped");
+}
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use twinkle_tray_rust::app::{self, AppPaths, LaunchOptions};
@@ -144,12 +249,23 @@ fn main() {
         return;
     }
 
+    // --udp-smoke：UDP 服务器真机对拍（启动 → 发包 → 校验响应 → 退出）
+    if opts.udp_smoke {
+        run_udp_smoke(&host, &settings, &paths);
+        host.manager.set_quitting(true);
+        host.manager.stop();
+        return;
+    }
+
     let shared_settings = Arc::new(Mutex::new(settings.clone()));
 
     // settings 路径快照(托盘菜单构建读取;等价原版 setTrayMenu 读内存 settings)
     {
         let mut slot = SETTINGS_PATH_SNAPSHOT.lock().unwrap();
         *slot = Some(paths.settings_path.clone());
+        // TT_SETTINGS_PATH：settings_host 落盘与 Open Settings 按钮用
+        // （update_setting 的 writeSettings 落盘调度读取此变量）
+        std::env::set_var("TT_SETTINGS_PATH", &paths.settings_path);
     }
 
     // 托盘图标（equiv createTray：图标随主题切换，§1.2 禁止自绘）
@@ -171,6 +287,9 @@ fn main() {
 
     // analytics 埋点（equiv L1429-L1440：settings.analytics 开关 + 29min 周期）
     system.sync_analytics(&settings);
+
+    // UDP 服务器（equiv L1326-L1330 的启动分支：udpEnabled === true → udp.start）
+    twinkle_tray_rust::udp_host::sync_udp_server(Some(&runtime), &shared_settings, None);
 
     // 主进程 UI（主线程 = Slint 事件循环，AGENTS.md §5）
     if let Err(e) = twinkle_tray_rust::run_panel(

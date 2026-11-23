@@ -11,6 +11,7 @@ pub mod net;
 pub mod panel_controller;
 pub mod runtime_hosts;
 pub mod system_events;
+pub mod udp_host;
 pub mod update_host;
 pub mod settings_host;
 pub mod settings_view;

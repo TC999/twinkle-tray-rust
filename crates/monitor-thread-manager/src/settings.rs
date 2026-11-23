@@ -4,6 +4,7 @@
 //! L108-L114（defaultLightSensorSettings）、L1099-L1160（版本迁移）。
 //! settings.json 必须与原版双向兼容（AGENTS.md §3.2：老用户配置文件可直接用）。
 
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 /// defaultLightSensorSettings 等价（equiv light-sensor.js:L7-L20）。
@@ -164,6 +165,19 @@ pub fn version_lt(a: &[u32], b: &[u32]) -> bool {
         }
     }
     false
+}
+
+/// writeSettings 的磁盘写盘部分（equiv electron.js:L1225-L1233）。
+/// JSON.stringify(settings, null, '\t') 的等价：tab 缩进序列化，
+/// 写失败仅记录错误（equiv 原版回调里的 debug.error），不 panic（AGENTS.md §5）。
+pub fn write_settings_file(settings_path: &std::path::Path, settings: &Value) -> Result<(), String> {
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b"\t");
+    let mut buf = Vec::new();
+    {
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        settings.serialize(&mut ser).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(settings_path, buf).map_err(|e| e.to_string())
 }
 
 /// normalizeMonitorOrder 等价（equiv L1085-L1105）：

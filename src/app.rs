@@ -84,6 +84,8 @@ pub struct LaunchOptions {
     pub ui_demo: bool,
     /// --brightness-smoke=<level>（亮度闭环对拍）
     pub brightness_smoke: Option<f64>,
+    /// --udp-smoke（UDP 服务器真机对拍）
+    pub udp_smoke: bool,
 }
 
 impl LaunchOptions {
@@ -106,6 +108,7 @@ impl LaunchOptions {
                 .iter()
                 .find_map(|a| a.strip_prefix("--brightness-smoke="))
                 .and_then(|v| v.parse::<f64>().ok()),
+            udp_smoke: args.iter().any(|a| a == "--udp-smoke"),
         }
     }
 }

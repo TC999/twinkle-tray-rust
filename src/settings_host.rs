@@ -107,6 +107,11 @@ fn wire_callbacks(
         };
         let updated = update_setting(&snap, &key, parsed);
         apply_side_effects(&worker, &key, &updated);
+        // udpEnabled 开关（equiv L1326-L1330）：true 启动 / false 停止
+        if key == "udpEnabled" {
+            let enable = updated.get("udpEnabled").and_then(|v| v.as_bool());
+            crate::udp_host::sync_udp_server(None, &snap, enable);
+        }
         let page = ui.get_active_page().to_string();
         ui.set_items(settings_view::model(settings_view::build_items(
             &page, &updated,
@@ -207,6 +212,57 @@ fn wire_callbacks(
     });
 }
 
+/// writeSettings 的磁盘写盘调度（equiv electron.js:L1224-L1233 的 333ms 防抖）。
+///
+/// 原版语义：writeSettingsTimeout 为空时排期一次 333ms 定时器，期间多次
+/// writeSettings 不重置定时器；到期时把当时全局 settings 对象落盘。
+/// Rust 等价：防抖标志置位期间不再排期，定时线程到期时读取最新 settings。
+///
+/// 线程模型：定时线程为短命线程，仅做一次 fs::write；异常走降级日志，
+/// 不 panic（AGENTS.md §5）。
+static WRITE_DEBOUNCE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// settings 落盘路径：TT_SETTINGS_PATH（main 启动时写入）优先，
+/// 否则退回 TT_CONFIG_DIR/settings.json。
+fn settings_write_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("TT_SETTINGS_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    std::env::var("TT_CONFIG_DIR")
+        .map(|c| std::path::PathBuf::from(c).join("settings.json"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("settings.json"))
+}
+
+/// 排期一次 settings 落盘（333ms 防抖，等价原版 writeSettings 的写盘分支）。
+pub fn schedule_write_settings(settings: &Arc<Mutex<Value>>) {
+    let mut state = WRITE_DEBOUNCE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.is_some() {
+        // 防抖中：等价原版 if (!writeSettingsTimeout) 的否定分支，不重置定时器
+        return;
+    }
+    let path = settings_write_path();
+    *state = Some(path.clone());
+    drop(state);
+
+    let settings = settings.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(333));
+        // 核对防抖标志仍属于本次排期（防抖期间可能已由 stop 取消的场景）
+        let mut st = WRITE_DEBOUNCE.lock().unwrap_or_else(|e| e.into_inner());
+        let still_active = matches!(&*st, Some(p) if *p == path);
+        if !still_active {
+            return;
+        }
+        *st = None;
+        let snapshot = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
+        if let Err(e) = monitor_thread_manager::write_settings_file(&path, &snapshot) {
+            // equiv debug.error("Couldn't save settings.", settingsPath, e)
+            crate::logger::log_as("MAIN", "error", &format!("Couldn't save settings: {}", e));
+        }
+    });
+}
+
 /// 写入单个设置键并返回新快照。
 fn update_setting(settings: &Arc<Mutex<Value>>, key: &str, value: Value) -> Value {
     let mut guard = match settings.lock() {
@@ -216,7 +272,10 @@ fn update_setting(settings: &Arc<Mutex<Value>>, key: &str, value: Value) -> Valu
     if let Some(obj) = guard.as_object_mut() {
         obj.insert(key.to_string(), value);
     }
-    guard.clone()
+    let updated = guard.clone();
+    // equiv writeSettings（L1221-L1237）：内存合并后按 333ms 防抖落盘
+    schedule_write_settings(settings);
+    updated
 }
 
 /// processSettings 的 UI 可达副作用（equiv L1240-L1471）：
@@ -420,8 +479,18 @@ fn handle_settings_button(
             guard["userClosedIntro"] = json!(true);
             let snapshot = guard.clone();
             drop(guard);
+            // equiv writeSettings（L1221-L1237）落盘调度
+            schedule_write_settings(settings);
             host.send(json!({"type": "settings", "settings": snapshot}));
             host.refresh_monitors(true, true);
+        }
+        // debug 页 All Displays（equiv L1723：requestMonitors(true) / flush-vcp-cache）
+        "refresh-monitors" => {
+            host.refresh_monitors(true, true);
+        }
+        "clear-cache" => {
+            // equiv ipc.send('flush-vcp-cache')：worker 侧清 vcp 缓存
+            host.send(json!({"type": "flushvcp"}));
         }
         "save-report" => {
             // equiv L3733-L3740：getReport -> 写报告文件
@@ -537,10 +606,71 @@ mod tests {
     }
 
     #[test]
+    fn write_settings_file_serializes_with_tabs() {
+        let dir = std::env::temp_dir().join("tt-settings-write-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("settings.json");
+        let settings = json!({"theme": "dark", "updateInterval": 500});
+        monitor_thread_manager::write_settings_file(&file, &settings).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        // 原版 JSON.stringify(settings, null, '\t')：tab 缩进 + 双空格
+        assert!(text.starts_with('{'));
+        assert!(text.contains("\t"));
+        // 再读回等价性
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, settings);
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn schedule_write_settings_debounces() {
+        let dir = std::env::temp_dir().join("tt-settings-debounce-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("settings.json");
+        std::env::set_var("TT_SETTINGS_PATH", &file);
+        // 等待前序测试的防抖落盘线程完成（WRITE_DEBOUNCE 是进程级单例，
+        // 防抖标志未清时排期会被忽略——轮询等待标志清空）
+        let mut waited = 0;
+        loop {
+            let busy = WRITE_DEBOUNCE.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            if !busy || waited >= 100 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            waited += 1;
+        }
+        let settings = Arc::new(Mutex::new(json!({"a": 1})));
+        // 连续两次排期：防抖语义（第二次被忽略，只有一次落盘线程）
+        schedule_write_settings(&settings);
+        schedule_write_settings(&settings);
+        // 轮询等待 333ms 定时线程落盘完成（上限 5s）
+        let mut polled = 0;
+        while !file.exists() && polled < 50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            polled += 1;
+        }
+        assert!(file.exists(), "settings file not written after {}ms", polled * 100);
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(back["a"], json!(1));
+        std::env::remove_var("TT_SETTINGS_PATH");
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn update_setting_returns_new_snapshot() {
+        let dir = std::env::temp_dir().join("tt-settings-update-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("settings.json");
+        std::env::set_var("TT_SETTINGS_PATH", &file);
         let settings = Arc::new(Mutex::new(json!({"theme": "default"})));
         let updated = update_setting(&settings, "theme", json!("dark"));
         assert_eq!(updated["theme"], json!("dark"));
         assert_eq!(settings.lock().unwrap()["theme"], json!("dark"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::env::remove_var("TT_SETTINGS_PATH");
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

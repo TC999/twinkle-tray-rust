@@ -255,6 +255,8 @@ fn run_panel_controller_inner(
     let weak = panel.as_weak();
 
     let initial_settings = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
+    // 面板定位的 settings 快照（default_panel_position 读 overrideTaskbarPosition/Gap）
+    PANEL_SETTINGS_OVERRIDE.with(|s| *s.borrow_mut() = initial_settings.clone());
     let state = Rc::new(RefCell::new(PanelState {
         settings: initial_settings.clone(),
         ..Default::default()
@@ -1042,6 +1044,18 @@ fn handle_tray_event(
             if visible {
                 let _ = ui.hide();
                 state.borrow_mut().visible = false;
+                // killWhenIdle（equiv L3684-L3688 panel-hidden）：Electron 的
+                // mainWindow.close() 在 Slint 无等价销毁 API，以隐藏降级（窗口
+                // 资源已由 hide 释放；差异记录于 PROGRESS.md）
+                if state
+                    .borrow()
+                    .settings
+                    .get("killWhenIdle")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    println!("killWhenIdle: panel hidden (window destroy unsupported; hide as fallback)");
+                }
             } else {
                 state.borrow_mut().visible = true;
                 let _ = ui.show();
@@ -1173,16 +1187,43 @@ fn handle_tray_event(
 /// 面板默认位置（equiv positionPanel：任务栏所在边贴边）。
 /// 主显示器工作区右下角，按面板尺寸内缩 12px。
 fn default_panel_position(ui: &crate::PanelWindow) -> slint::PhysicalPosition {
+    // equiv taskbarPosition（L4065-L4118）+ overrideTaskbarPosition/Gap（L4105-L4115）：
+    // 真实任务栏探测依赖 Shell 任务栏矩形（Slint 无 work area API），以主屏分辨率
+    // 假定 BOTTOM + gap 12 等价降级（PROGRESS.md 记录）；override 键原样支持。
+    let settings = PANEL_SETTINGS_OVERRIDE.with(|s| s.borrow().clone());
+    let mut position = "BOTTOM";
+    if let Some(pos) = settings
+        .get("overrideTaskbarPosition")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_uppercase())
+    {
+        if ["BOTTOM", "TOP", "LEFT", "RIGHT"].contains(&pos.as_str()) {
+            position = Box::leak(pos.into_boxed_str());
+        }
+    }
+    let mut gap: i32 = 12;
+    if let Some(g) = settings.get("overrideTaskbarGap").and_then(|v| v.as_i64()) {
+        gap = g as i32;
+    }
     let size = ui.window().size();
     let screen_w = 1920;
     let screen_h = 1080;
     let scale = ui.window().scale_factor();
     let w = (size.width as f32 / scale) as i32;
     let h = (size.height as f32 / scale) as i32;
-    slint::PhysicalPosition::new(
-        (((screen_w - w - 12) as f32) * scale) as i32,
-        (((screen_h - h - 12) as f32) * scale) as i32,
-    )
+    let (x, y) = match position {
+        "TOP" => (screen_w - w - gap, gap),
+        "LEFT" => (gap, screen_h - h - gap),
+        "RIGHT" => (screen_w - w - gap, screen_h - h - gap),
+        _ => (screen_w - w - gap, screen_h - h - gap),
+    };
+    slint::PhysicalPosition::new((x as f32 * scale) as i32, (y as f32 * scale) as i32)
+}
+
+// 面板定位用 settings 快照（run_panel_controller 安装；thread_local 等价单线程语义）
+thread_local! {
+    static PANEL_SETTINGS_OVERRIDE: std::cell::RefCell<serde_json::Value> =
+        std::cell::RefCell::new(serde_json::Value::Object(Default::default()));
 }
 
 /// worker 事件处理（equiv monitorThread.on("message") 的 UI 侧分支）。

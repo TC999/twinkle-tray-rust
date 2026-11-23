@@ -171,6 +171,16 @@ pub fn apply_window_material(hwnd: isize, settings: &Value) {
         // DWMSBT_MAINWINDOW = 2（Mica）
         let _ = twutils::window_material::set_window_material(window, 2, 0, 1);
     } else {
+        // equiv L4333-L4340 / L3694-L3701：useNativeAnimation=false 时
+        // Win10 亚克力退化为无材质（tryVibrancy(false) 分支）
+        let native_animation = settings
+            .get("useNativeAnimation")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !native_animation {
+            let _ = twutils::window_material::set_window_material(window, 0, 0, 0);
+            return;
+        }
         // DWMSBT_TRANSIENTWINDOW = 3（亚克力）
         let _ = twutils::window_material::set_window_material(window, 3, 0, 1);
     }
