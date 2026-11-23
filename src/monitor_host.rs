@@ -44,7 +44,7 @@ impl MonitorHost {
         let host = self.clone();
         let settings_snapshot = Arc::new(Mutex::new(settings_snapshot));
         let ddc_vcps = Arc::new(Mutex::new(ddc_brightness_vcps));
-        self.manager.set_event_callback(Arc::new(move |data: &Value| {
+        self.manager.add_event_callback(Arc::new(move |data: &Value| {
             let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
             *host.last_event.lock().unwrap() = Some(data.clone());
             match event_type {

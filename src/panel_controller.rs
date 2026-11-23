@@ -12,9 +12,10 @@
 
 use crate::monitor_host::MonitorHost;
 use crate::monitor_view;
+use crate::ui_types::PanelMonitor;
 use crate::window_state;
 use serde_json::{json, Value};
-use slint::{ComponentHandle, ModelRc, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -43,6 +44,9 @@ pub struct PanelState {
     pub pending_sdr: Vec<(String, f64)>,
     /// 待关闭显示器（sleepAction 走 DDC 时需要）
     pub pending_sleep_ddc: Vec<String>,
+    /// 面板列表模型的单实例（首帧注入，之后按行增量更新）。
+    /// 等价 React 的 key 复用：整表重建会销毁正在拖动的滑块 / 正在编辑的数值框。
+    pub panel_model: Option<Rc<VecModel<PanelMonitor>>>,
 }
 
 impl Default for PanelState {
@@ -60,13 +64,17 @@ impl Default for PanelState {
             pending_gamma: Vec::new(),
             pending_sdr: Vec::new(),
             pending_sleep_ddc: Vec::new(),
+            panel_model: None,
         }
     }
 }
 
 /// 单个 (id, vcp) 目标的节流状态（equiv brightnessThrottleTargets）。
 struct ThrottleEntry {
-    last_time: Instant,
+    /// 上次真正写入的时刻；None = 从未写入（首次请求立即放行）。
+    /// 原实现用 `now - 3600s` 表示"很久以前"，在系统开机不足 1 小时的机器上
+    /// `Instant - Duration` 会 panic（真机复现：点滑条即崩）。
+    last_time: Option<Instant>,
     pending: Option<PendingWrite>,
     timeout_at: Option<Instant>,
 }
@@ -113,15 +121,17 @@ impl BrightnessThrottle {
         let target = format!("{}::{}", id, Self::vcp_key(vcp));
         let now = Instant::now();
         let entry = self.targets.entry(target).or_insert_with(|| ThrottleEntry {
-            last_time: now - Duration::from_secs(3600),
+            last_time: None,
             pending: None,
             timeout_at: None,
         });
 
-        if entry.timeout_at.is_none()
-            && now.duration_since(entry.last_time).as_millis() as u64 >= interval_ms
-        {
-            entry.last_time = now;
+        let interval_elapsed = entry
+            .last_time
+            .map(|t| now.saturating_duration_since(t).as_millis() as u64 >= interval_ms)
+            .unwrap_or(true);
+        if entry.timeout_at.is_none() && interval_elapsed {
+            entry.last_time = Some(now);
             return Some((id.to_string(), level, vcp.to_string()));
         }
 
@@ -131,7 +141,8 @@ impl BrightnessThrottle {
             vcp: vcp.to_string(),
         });
         if entry.timeout_at.is_none() {
-            let due = entry.last_time + Duration::from_millis(interval_ms);
+            let base = entry.last_time.unwrap_or(now);
+            let due = base + Duration::from_millis(interval_ms);
             entry.timeout_at = Some(due.max(now));
         }
         None
@@ -146,7 +157,7 @@ impl BrightnessThrottle {
                 continue;
             }
             entry.timeout_at = None;
-            entry.last_time = now;
+            entry.last_time = Some(now);
             if let Some(pending) = entry.pending.take() {
                 out.push((pending.id, pending.level, pending.vcp));
             }
@@ -178,7 +189,7 @@ impl PanelController {
         let (tx, rx) = channel::<Value>();
         let tx_clone: Sender<Value> = tx;
         host.manager
-            .set_event_callback(Arc::new(move |data: &Value| {
+            .add_event_callback(Arc::new(move |data: &Value| {
                 let _ = tx_clone.send(data.clone());
             }));
         Self {
@@ -1333,15 +1344,46 @@ fn flush_pending(state: &Rc<RefCell<PanelState>>, host: &Arc<MonitorHost>) {
 }
 
 /// 刷新 UI model（equiv setState -> React 重渲染）。
+///
+/// 列表模型只创建一次，之后按行增量更新：等价 React 用 key 复用 DOM 节点。
+/// 每帧整表重建会销毁正在拖动的滑块（TouchArea 的 pressed 丢失）和正在编辑的
+/// 数值框（LineEdit 失焦），表现为"滑块一拖就跳回/根本拖不动"。
 fn refresh_ui(ui: &crate::PanelWindow, state: &Rc<RefCell<PanelState>>) {
-    let st = state.borrow();
-    let (models, count) = monitor_view::build_panel_model(
+    let mut st = state.borrow_mut();
+    let (rows, count) = monitor_view::build_panel_model(
         &st.monitors,
         &st.settings,
         st.linked_levels,
     );
-    let model = ModelRc::new(VecModel::from(models));
-    ui.set_monitors(model);
+
+    match st.panel_model.clone() {
+        Some(model) => {
+            // 行数对齐（减少时从尾部裁掉）
+            while model.row_count() > rows.len() {
+                model.remove(model.row_count() - 1);
+            }
+            for (index, row) in rows.iter().enumerate() {
+                let unchanged = model
+                    .row_data(index)
+                    .map(|old| panel_monitor_equal(&old, row))
+                    .unwrap_or(false);
+                if unchanged {
+                    continue;
+                }
+                if index < model.row_count() {
+                    model.set_row_data(index, row.clone());
+                } else {
+                    model.push(row.clone());
+                }
+            }
+        }
+        None => {
+            let model = Rc::new(VecModel::from(rows));
+            ui.set_monitors(ModelRc::new(model.clone()));
+            st.panel_model = Some(model);
+        }
+    }
+
     ui.set_visible_count(count);
     ui.set_linked_levels(st.linked_levels);
     ui.set_linked_levels_available(count > 1);
@@ -1360,6 +1402,56 @@ fn refresh_ui(ui: &crate::PanelWindow, state: &Rc<RefCell<PanelState>>) {
             .and_then(|v| v.as_f64())
             .unwrap_or(2.0) as f32,
     );
+}
+
+/// 两行渲染数据是否等价（用于增量更新判定）。
+/// Slint 生成的 struct 内部含 ModelRc（features/inputs），其 PartialEq 按模型身份比较，
+/// 每次构建都是新模型，因此这里逐字段 + 逐特征行比较。
+fn panel_monitor_equal(a: &PanelMonitor, b: &PanelMonitor) -> bool {
+    if a.key != b.key
+        || a.id != b.id
+        || a.name != b.name
+        || a.display_type != b.display_type
+        || a.brightness != b.brightness
+        || a.minimum != b.minimum
+        || a.maximum != b.maximum
+        || a.num != b.num
+        || a.adjustable != b.adjustable
+        || a.show_power != b.show_power
+        || a.power_on != b.power_on
+        || a.hdr_only_sdr != b.hdr_only_sdr
+        || a.extended != b.extended
+    {
+        return false;
+    }
+    if a.features.row_count() != b.features.row_count() {
+        return false;
+    }
+    for index in 0..a.features.row_count() {
+        let (Some(fa), Some(fb)) = (a.features.row_data(index), b.features.row_data(index)) else {
+            return false;
+        };
+        if fa.code != fb.code
+            || fa.kind != fb.kind
+            || fa.level != fb.level
+            || fa.max != fb.max
+            || fa.icon != fb.icon
+            || fa.icon_text != fb.icon_text
+            || fa.current_input != fb.current_input
+            || fa.inputs.row_count() != fb.inputs.row_count()
+        {
+            return false;
+        }
+        for i in 0..fa.inputs.row_count() {
+            let (Some(ia), Some(ib)) = (fa.inputs.row_data(i), fb.inputs.row_data(i)) else {
+                return false;
+            };
+            if ia.value != ib.value || ia.label != ib.label {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// 亮度闭环对拍（--brightness-smoke 用）：

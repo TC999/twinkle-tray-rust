@@ -470,11 +470,17 @@ fn build_features(
                 current
             };
 
-            // 图标（equiv DDCCISliders.jsx:L93-L102）
+            // 图标（equiv DDCCISliders.jsx:L73/L83/L92 与 custom 的默认 E897）
             let icon_type = per_feature_settings
                 .get("iconType")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let default_icon = match vcp.as_str() {
+                "0x12" => "\u{e793}", // Contrast
+                "0x62" => "\u{e767}", // Volume
+                "0x60" => "\u{e839}", // Inputs
+                _ => "\u{e897}",      // Custom 默认
+            };
             let (icon, icon_text) = if icon_type == "windows" {
                 let code_str = per_feature_settings
                     .get("icon")
@@ -500,7 +506,7 @@ fn build_features(
                         .to_string(),
                 )
             } else {
-                ("\u{e897}".to_string(), String::new())
+                (default_icon.to_string(), String::new())
             };
 
             // 输入源按钮（equiv inputsData）

@@ -35,8 +35,11 @@ pub struct MonitorThreadManager {
     exe_path: Mutex<String>,
     datapath: Mutex<String>,
     recovering: AtomicBool,
-    /// 事件回调（主进程注入；等价 monitorThread.on("message", ...)）。
-    event_callback: Mutex<Option<Arc<dyn Fn(&Value) + Send + Sync>>>,
+    /// 事件回调表（主进程注入；等价 monitorThread.on("message", ...)）。
+    /// 原版是 EventEmitter，允许多个监听者（host 缓存 + 面板 UI 各一份），
+    /// 且监听器可以晚于 start() 注册 —— 因此这里存成列表，读取线程每收到一条
+    /// 消息都取当前列表广播，而不是在 start() 时快照单个回调。
+    event_callbacks: Arc<Mutex<Vec<Arc<dyn Fn(&Value) + Send + Sync>>>>,
     /// 失败提示回调（主进程注入；等价 dialog.showMessageBox，默认仅打印）。
     failure_notice: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
 }
@@ -53,14 +56,17 @@ impl MonitorThreadManager {
             exe_path: Mutex::new(exe_path),
             datapath: Mutex::new(datapath),
             recovering: AtomicBool::new(false),
-            event_callback: Mutex::new(None),
+            event_callbacks: Arc::new(Mutex::new(Vec::new())),
             failure_notice: Mutex::new(None),
         }
     }
 
-    /// 注册 worker 事件回调。
-    pub fn set_event_callback(&self, cb: Arc<dyn Fn(&Value) + Send + Sync>) {
-        *self.event_callback.lock().unwrap() = Some(cb);
+    /// 追加一个 worker 事件监听器（等价 monitorThread.on("message", ...)）。
+    /// 可在 start() 之后调用；读取线程每收到消息都取当前列表广播。
+    pub fn add_event_callback(&self, cb: Arc<dyn Fn(&Value) + Send + Sync>) {
+        if let Ok(mut list) = self.event_callbacks.lock() {
+            list.push(cb);
+        }
     }
 
     /// 注册失败提示回调（等价 dialog.showMessageBox 的替身；未注册时仅打印）。
@@ -112,7 +118,7 @@ impl MonitorThreadManager {
                 let stdin = c.stdin.take().expect("stdin 已 piped");
                 // stdout 读取线程：行协议 -> 事件回调（等价 monitorThread.on("message", ...)）
                 if let Some(stdout) = c.stdout.take() {
-                    let cb = self.event_callback.lock().unwrap().clone();
+                    let callbacks = self.event_callbacks.clone();
                     // 等价 monitorThread.on("message", ...) 的 ready 分支：
                     // 读取线程直接置就绪标志（原版由主进程的 message 监听器完成）。
                     let ready_flag = self.ready.clone();
@@ -125,7 +131,13 @@ impl MonitorThreadManager {
                                         if v.get("type").and_then(|t| t.as_str()) == Some("ready") {
                                             ready_flag.store(true, Ordering::SeqCst);
                                         }
-                                        if let Some(cb) = cb.as_ref() {
+                                        // 先克隆出监听器列表再调用，避免回调内注册监听器时自锁；
+                                        // 也保证 start() 之后才注册的监听器能收到后续事件。
+                                        let listeners: Vec<_> = match callbacks.lock() {
+                                            Ok(list) => list.clone(),
+                                            Err(_) => Vec::new(),
+                                        };
+                                        for cb in listeners.iter() {
                                             cb(&v);
                                         }
                                     }

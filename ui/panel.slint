@@ -7,7 +7,6 @@
 //   - 电源按钮（features["0xD6"]）、睡眠、设置入口
 //   - 更新提示条 + 下载进度条
 import { Theme } from "theme.slint";
-import { LineEdit } from "std-widgets.slint";
 
 export enum DisplayType {
     wmi,
@@ -89,6 +88,8 @@ component IconButton inherits Rectangle {
 }
 
 // 自绘滑块（equiv Slider.jsx：range + progress + 数值框 + 滚轮）
+// 注意：根元素不设 width —— 由外层布局按 horizontal-stretch 分配宽度。
+// 之前的 `width: 100%` 会让滑块吃掉整行宽度（把同行的数值框顶出窗口）。
 component TtSlider inherits Rectangle {
     in property <float> level: 50;
     in property <float> minimum: 0;
@@ -97,38 +98,41 @@ component TtSlider inherits Rectangle {
     in property <bool> enabled: true;
     callback changed(float);
 
-    width: 100%;
-    height: 20px;
+    min-width: 40px;
+    height: 24px;
     background: transparent;
 
     property <float> capped: clamp(root.level, root.minimum, root.maximum);
     property <float> ratio: (root.maximum > root.minimum) ? clamp((root.capped - root.minimum) / (root.maximum - root.minimum), 0, 1) : 0;
+    property <length> thumb-width: 8px;
+    property <length> track-height: 4px;
 
-    // 轨道（equiv .range / .progress）
+    // 轨道（equiv .range::-webkit-slider-runnable-track）
     Rectangle {
-        y: (parent.height - 5px) / 2;
+        x: 0;
+        y: (parent.height - root.track-height) / 2;
         width: parent.width;
-        height: 5px;
-        border-radius: 2.5px;
+        height: root.track-height;
+        border-radius: root.track-height / 2;
         background: Theme.slider-track;
     }
+    // 已填充进度（equiv .progress，宽度按 (level-min)/(max-min) 比例）
     Rectangle {
-        y: (parent.height - 5px) / 2;
+        x: 0;
+        y: (parent.height - root.track-height) / 2;
         width: parent.width * root.ratio;
-        height: 5px;
-        border-radius: 2.5px;
+        height: root.track-height;
+        border-radius: root.track-height / 2;
         background: Theme.accent-medium;
     }
-    // 滑块手柄（equiv .range::-webkit-slider-thumb）
+    // 滑块手柄（equiv .range::-webkit-slider-thumb：8x24 圆角胶囊，hover 变亮）
     Rectangle {
-        x: (parent.width - 14px) * root.ratio;
-        y: (parent.height - 14px) / 2;
-        width: 14px;
-        height: 14px;
-        border-radius: 7px;
-        background: Theme.accent-medium;
-        border-width: 1px;
-        border-color: Theme.slider-thumb-border;
+        x: (parent.width - root.thumb-width) * root.ratio;
+        y: (parent.height - 22px) / 2;
+        width: root.thumb-width;
+        height: 22px;
+        border-radius: 4px;
+        background: ta.has-hover && root.enabled ? Theme.text : Theme.accent-medium;
     }
 
     ta := TouchArea {
@@ -161,10 +165,11 @@ component TtSlider inherits Rectangle {
         return 0;
     }
 
-    // 点击/拖拽 -> 亮度（等价 input[type=range] 的取值语义）
+    // 点击/拖拽 -> 亮度（等价 input[type=range] 的取值语义：按手柄中心换算）
     public function level-from-x(x: length) {
         if (root.maximum <= root.minimum) { return; }
-        let ratio-from-x = clamp((x - 7px) / max(root.width - 14px, 1px), 0, 1);
+        let usable = max(root.width - root.thumb-width, 1px);
+        let ratio-from-x = clamp((x - root.thumb-width / 2) / usable, 0, 1);
         let new-level = round(root.minimum + ratio-from-x * (root.maximum - root.minimum));
         if (new-level != round(root.level)) {
             root.changed(new-level);
@@ -180,40 +185,72 @@ component TtSlider inherits Rectangle {
     }
 }
 
-// 数值框（equiv input.val：点击可编辑，回车/失焦提交）
+// 数值框（equiv input.val：点击可编辑，输入即生效，回车/失焦结束编辑）
 component ValueBox inherits Rectangle {
     in property <float> level: 0;
     in property <float> minimum: 0;
     in property <float> maximum: 100;
     in property <bool> enabled: true;
+    in property <length> box-width: 44px;
+    in property <length> font-size: 14px;
     callback edited(float);
 
-    width: 44px;
-    height: 20px;
+    width: root.box-width;
+    height: 22px;
     border-radius: 4px;
     background: editing ? Theme.input-active-bg : transparent;
     border-width: editing ? 1px : 0px;
     border-color: Theme.input-border;
 
     property <bool> editing: false;
+    // 编辑草稿：与 level 解耦，避免"输入一位 -> 模型回写 -> 光标/文本被重置"
+    property <string> draft: "";
 
     if (!editing) : Text {
         text: "\{round(root.level)}";
-        font-size: 12px;
+        font-size: root.font-size;
         color: Theme.text;
         vertical-alignment: center;
         horizontal-alignment: center;
         TouchArea {
             enabled: root.enabled;
-            clicked => { root.editing = true; }
+            clicked => {
+                root.draft = "\{round(root.level)}";
+                root.editing = true;
+            }
         }
     }
-    if (editing) : LineEdit {
-        text: "\{round(root.level)}";
-        horizontal-alignment: center;
-        accepted(t) => {
-            root.commit(t);
-            root.editing = false;
+    // 用内建 TextInput 而不是 std-widgets 的 LineEdit：
+    // 后者 min-width 硬编码 160px，塞进 44px 的数值框会溢出把布局撑破。
+    // 焦点链：FocusScope.focus() + forward-focus: editor 才能把键盘事件交给 TextInput。
+    if (editing) : fs := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        forward-focus: editor;
+        init => {
+            fs.focus();
+            // 全选，直接输入即替换旧值（否则会在旧数字里插入字符，如 "70" -> "4570"）
+            editor.select-all();
+        }
+        changed has-focus => {
+            if (!fs.has-focus) {
+                root.commit(root.draft);
+                root.editing = false;
+            }
+        }
+        editor := TextInput {
+            width: parent.width;
+            height: parent.height;
+            text <=> root.draft;
+            font-size: root.font-size;
+            color: Theme.text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            edited => { root.commit(root.draft); }
+            accepted => {
+                root.commit(root.draft);
+                root.editing = false;
+            }
         }
     }
 
@@ -241,8 +278,8 @@ component BrightnessRow inherits Rectangle {
     background: transparent;
 
     VerticalLayout {
-        spacing: 6px;
-        padding-top: 8px;
+        spacing: 4px;
+        padding-top: 6px;
         // name-row
         HorizontalLayout {
             height: 22px;
@@ -290,20 +327,24 @@ component BrightnessRow inherits Rectangle {
             }
             ValueBox {
                 level: root.level;
+                box-width: 52px;
+                font-size: 18px;
                 edited(v) => { root.changed(v); }
             }
         }
     }
 }
 
-// 特征行（equiv .feature-row：图标 + 滑块）
+// 特征行（equiv .feature-row：图标 + 滑块 + 数值框）
 component FeatureRow inherits Rectangle {
     in property <string> icon: "\u{e897}";
     in property <string> icon-text: "";
     in property <float> level: 50;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
     in property <float> scroll-amount: 2;
     callback changed(float);
-    height: 46px;
+    height: 40px;
     background: transparent;
 
     HorizontalLayout {
@@ -329,26 +370,51 @@ component FeatureRow inherits Rectangle {
         }
         TtSlider {
             level: root.level;
+            minimum: root.minimum;
+            maximum: root.maximum;
             scroll-amount: root.scroll-amount;
             horizontal-stretch: 1;
             changed(v) => { root.changed(v); }
         }
+        ValueBox {
+            level: root.level;
+            minimum: root.minimum;
+            maximum: root.maximum;
+            box-width: 44px;
+            font-size: 14px;
+            edited(v) => { root.changed(v); }
+        }
     }
 }
 
-// 输入源按钮组（equiv DDCCISliders.jsx 的 0x60 分支）
+// 输入源按钮组（equiv DDCCISliders.jsx 的 0x60 分支：feature-icon + 按钮换行）
 component InputRow inherits Rectangle {
+    in property <string> icon: "\u{e839}";
     in property <[PanelInput]> inputs: [];
     in property <int> current: 0;
     callback picked(int);
     background: transparent;
     height: layout.preferred-height + 8px;
 
-    layout := VerticalLayout {
-        spacing: 4px;
+    layout := HorizontalLayout {
+        spacing: 8px;
         padding-top: 4px;
+        padding-bottom: 4px;
+        Rectangle {
+            width: 24px;
+            background: transparent;
+            Text {
+                text: root.icon;
+                font-family: "Segoe MDL2 Assets";
+                font-size: 16px;
+                color: Theme.text-mid;
+                vertical-alignment: top;
+                horizontal-alignment: center;
+            }
+        }
         FlexboxLayout {
             spacing: 3px;
+            horizontal-stretch: 1;
             for input in root.inputs : Rectangle {
                 height: 22px;
                 width: label.preferred-width + 16px;
@@ -488,7 +554,9 @@ export component PanelWindow inherits Window {
     always-on-top: true;
     background: transparent;
     width: 356px;
-    height: body.preferred-height;
+    // 高度由内容布局决定（equiv React 侧 offsetHeight -> sendHeight）：
+    // body 显式绑定 content 的 preferred-height，避免 "窗口高度 <-> body 高度" 的循环。
+    height: body.height;
 
     // Escape 关闭面板（equiv panel.js keydown Escape -> blur-panel）
     focus := FocusScope {
@@ -507,6 +575,8 @@ export component PanelWindow inherits Window {
             border-width: 1px;
             border-color: Theme.border;
             width: 100%;
+            // 内容高度 + 上下边框；显式绑定，避免与外层 FocusScope 的 100% 高度互锁
+            height: content.preferred-height + 2px;
 
             content := VerticalLayout {
                 padding-left: 15px;
@@ -654,6 +724,7 @@ export component PanelWindow inherits Window {
                             for feature in monitor.features : VerticalLayout {
                                 spacing: 0px;
                                 if (feature.kind == FeatureKind.inputs) : InputRow {
+                                    icon: feature.icon;
                                     inputs: feature.inputs;
                                     current: feature.current-input;
                                     picked(v) => { root.input-picked(monitor.key, feature.code, v); }

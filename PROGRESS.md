@@ -408,3 +408,81 @@ Shell_NotifyIconGetRect → HRESULT=0x00000000 (S_OK)
 
 **质量状态（Round 9）**：cargo build --workspace 零错误零警告；cargo test --workspace **111 个测试全部通过**；
 真机 e2e（图标可见性 + 点击弹出面板 + 面板定位）通过。
+
+## Round 10 · 2026-11-23：修复「亮度调整窗没有滑动条」
+
+### 症状
+
+托盘左键弹出面板后，窗口里只有一个标题栏和一行 **"正在检测显示器..."**（或空白），
+**没有任何亮度滑条**；换 `--ui-demo` 强制注模能看到滑条，但滑条会冲出窗口右边界、
+右侧数字框完全不可见。
+
+### 根因（三处独立缺陷，叠加成"没滑条 + 拖不动 + 一点就崩"）
+
+| # | 缺陷 | 位置 | 后果 |
+|---|---|---|---|
+| 1 | **worker 事件监听器在 `start()` 时被快照成单个回调** | `crates/monitor-thread-manager/src/thread_manager.rs` | `main` 的顺序是 `install_handlers()` → `start()` → 建面板控制器。`start()` 里 `let cb = event_callback.lock().clone()` 把 host 的回调**复制**进读取线程；随后 `PanelController::new` 用 `set_event_callback` **覆盖**了字段，但读取线程仍持有旧回调 → 面板永远收不到 `refreshMonitors`/`monitorsEnriched` → `state.monitors` 恒为空 → `visible-count == 0` → 只渲染"正在检测显示器" |
+| 2 | **`TtSlider` 根元素 `width: 100%`** | `ui/panel.slint` | 布局内的百分比宽被解析成"整行宽度"，滑块吃掉同行的 52px 数值框空间并把数值框顶出窗口；窗口右侧因此看不到数字。原版 CSS 是 `.rangeGroup{flex:2}` + `.val{width:52px}`，滑块应占剩余宽度而非整行 |
+| 3 | **节流器用 `Instant::now() - 3600s` 表示"很久以前"** | `src/panel_controller.rs BrightnessThrottle::request` | 系统开机不足 1 小时时 `Instant - Duration` 直接 **panic**（`overflow when subtracting duration from instant`）。真机复现：面板刚出现滑条，点一下 → 整个主进程崩溃 |
+
+### 修复
+
+1. **事件回调改为多监听者广播**（`thread_manager.rs`）：
+   `event_callback: Mutex<Option<Arc<..>>>` → `event_callbacks: Arc<Mutex<Vec<Arc<..>>>>`，
+   新增 `add_event_callback()`（等价 EventEmitter 的 `.on()`，可重复注册）。
+   读取线程不再在 `start()` 时快照回调，而是**每收到一条消息取当前列表广播**（先克隆列表再调用，避免回调内注册导致自锁）。
+   `monitor_host.rs` 与 `panel_controller.rs` 两处调用点改为追加注册 → host 缓存与面板 UI 同时收到事件。
+2. **滑块宽度交给布局分配**（`ui/panel.slint`）：
+   去掉根元素 `width: 100%`，改 `min-width: 40px`，实例侧统一 `horizontal-stretch: 1`；
+   轨道/进度/手柄改为 `parent.width` 驱动。顺带对齐原版视觉：轨道 4px、手柄 8×22 圆角胶囊、
+   hover 变 `--tray-text`（原来的 14px 圆点是自造样式）。
+3. **节流器 `last_time` 改 `Option<Instant>`**（`panel_controller.rs`）：
+   `None` 表示"从未写入 → 首次立即放行"，比较用 `saturating_duration_since`，
+   排队到期时间以 `unwrap_or(now)` 为基准 —— 语义与"很久以前"完全等价，但不再依赖开机时长。
+4. **列表模型增量更新**（`panel_controller.rs refresh_ui`）：模型只创建一次（`PanelState::panel_model`），
+   之后按行 `set_row_data` / `push` / `remove`，逐字段比较（`panel_monitor_equal`）。
+   原来每 50ms tick 都新建 `VecModel` 并 `set_monitors` 整表重建，等价于 React 里把整棵列表卸载重建：
+   拖动中的 `TouchArea` 会丢 pressed（**拖一格就断**）、正在编辑的数值框会失焦。
+5. **补齐数值框与图标**（`ui/panel.slint` + `src/monitor_view.rs`）：
+   - `FeatureRow` 增加数值框（原版 `.feature-row .input--val` 是存在的，此前缺项）；
+   - 特征图标按原版 `DDCCISliders.jsx`：对比度 `E793`、音量 `E767`、输入源 `E839`、自定义默认 `E897`；
+   - 输入源行补 `E839` 图标列（原版 `.feature-icon`）；
+   - 数值框编辑改用内建 `TextInput` + `FocusScope{forward-focus: editor}`：
+     std-widgets 的 `LineEdit` 的 `min-width` 硬编码 160px，塞进 52px 数值框会把布局撑破，
+     且默认拿不到键盘焦点（`FocusScope` 不设 `forward-focus` 时按键不会到 `TextInput`）。
+     进入编辑态 `select-all()`，直接输入即替换旧值（否则会在 "70" 里插入成 "4570"）。
+6. **面板高度显式绑定**（`ui/panel.slint`）：`body.height = content.preferred-height + 2px`，窗口 `height: body.height`，
+   消除"窗口高度 ↔ body 100% 高度"的循环（此前扩展布局最后一行会被窗口底边切掉半行）。
+
+### 真机对拍（2026-11-23 · 1920×1080 @ 125% DPI，Win11，内屏 CMN1521 / WMI 亮度）
+
+```
+# 修复前
+面板 rect=1460,866,445,148  → 内容只有 "正在检测显示器..."（monitors 恒空）
+--ui-demo 注模：滑条右端溢出到窗口外，数值框不可见
+
+# 修复后（真实托盘点击，未注模）
+面板 rect=1460,848,445,168  内容: "Display 1" + 滑条 + 数值 64
+鼠标点击滑条 25% 处 → 面板数值 24；Get-CimInstance WmiMonitorBrightness → 24   ✅
+按住拖动 25% → 70%   → 面板数值 70；Get-CimInstance → 70                      ✅
+点击数值框 → 输入 "45" → 回车 → 面板 45；Get-CimInstance → 45                 ✅
+托盘左键隐藏 → 再左键显示 → 面板 rect 与数值不变，无崩溃                       ✅
+恢复原值：滑条点回 64% → Get-CimInstance → 64                                 ✅
+```
+
+扩展布局（`--ui-demo` 注入 0x12/0x62/0x60/0xD6）：
+
+```
+调整亮度 | Display 1 (关机)
+  [E706] 亮度      ———●———          70
+  [E793] 对比度    ——●————          50
+  [E839] [VGA-1][DVI-1][DisplayPort-1][HDMI-1]
+  [E767] 音量      —●—————          40
+```
+
+### 回归测试
+
+`cargo test --workspace` 全绿（含 `throttle_writes_immediately_then_queues` 覆盖"首次请求立即放行"语义，
+`throttle_keeps_latest_value`、`vcp_key_normalization` 覆盖节流器其余行为）。
+
+**质量状态（Round 10）**：`cargo build --workspace` 零错误零警告；真机 e2e（滑条渲染 / 点击 / 拖动 / 数值框 / 显隐循环）通过。
