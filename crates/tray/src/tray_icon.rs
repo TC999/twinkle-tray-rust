@@ -44,6 +44,8 @@ pub struct TrayMenuItem {
     pub checked: Option<bool>,
     /// 分隔线（label 无效）
     pub separator: bool,
+    /// 子菜单（equiv electron submenu；非空时该项为 MF_POPUP 父项）
+    pub children: Vec<TrayMenuItem>,
 }
 
 /// 托盘事件（主线程消费）。
@@ -212,14 +214,27 @@ pub fn remove_tray_icon(handle: &TrayIconHandle) {
     }
 }
 
-/// 弹出托盘菜单（equiv setTrayMenu 的 TrackPopupMenu）。
-unsafe fn show_menu(hwnd: HWND) {
-    let items = menu_slot().lock().map(|g| g.clone()).unwrap_or_default();
-    let Ok(menu) = CreatePopupMenu() else { return };
-    for item in &items {
+/// 递归追加菜单项到 HMENU（equiv Menu.buildFromTemplate 的 submenu 展开）。
+/// 非空 children 的项以 MF_POPUP 追加子菜单；点击子菜单项时 TrackPopupMenu
+/// 返回其 id（等价 electron submenu 项的 click 回调）。
+unsafe fn append_items(hmenu: windows::Win32::UI::WindowsAndMessaging::HMENU, items: &[TrayMenuItem]) {
+    for item in items {
         if item.separator {
             // MF_SEPARATOR = 0x800
-            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x0000_0800), 0, windows::core::PCWSTR::null());
+            let _ = AppendMenuW(hmenu, MENU_ITEM_FLAGS(0x0000_0800), 0, windows::core::PCWSTR::null());
+            continue;
+        }
+        if !item.children.is_empty() {
+            // 子菜单：MF_POPUP(0x10) 追加，uid 填子菜单句柄，label 为父项标题
+            let Ok(sub) = CreatePopupMenu() else { continue };
+            append_items(sub, &item.children);
+            let label: Vec<u16> = item.label.encode_utf16().chain(std::iter::once(0)).collect();
+            let flags = if item.enabled {
+                MENU_ITEM_FLAGS(0x0000_0010) // MF_POPUP
+            } else {
+                MENU_ITEM_FLAGS(0x0000_0010 | 0x0000_0003)
+            };
+            let _ = AppendMenuW(hmenu, flags, sub.0 as usize, windows::core::PCWSTR::from_raw(label.as_ptr()));
             continue;
         }
         let label: Vec<u16> = item.label.encode_utf16().chain(std::iter::once(0)).collect();
@@ -235,8 +250,15 @@ unsafe fn show_menu(hwnd: HWND) {
                 flags = flags | MENU_ITEM_FLAGS(0x0000_0008);
             }
         }
-        let _ = AppendMenuW(menu, flags, item.id as usize, windows::core::PCWSTR::from_raw(label.as_ptr()));
+        let _ = AppendMenuW(hmenu, flags, item.id as usize, windows::core::PCWSTR::from_raw(label.as_ptr()));
     }
+}
+
+/// 弹出托盘菜单（equiv setTrayMenu 的 TrackPopupMenu）。
+unsafe fn show_menu(hwnd: HWND) {
+    let items = menu_slot().lock().map(|g| g.clone()).unwrap_or_default();
+    let Ok(menu) = CreatePopupMenu() else { return };
+    append_items(menu, &items);
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     // 菜单弹出前必须把窗口置前，否则点击外部不会关闭（Win32 托盘菜单惯例）
@@ -434,6 +456,28 @@ mod tests {
         assert_eq!(TrayEvent::Click, TrayEvent::Click);
         assert_ne!(TrayEvent::Click, TrayEvent::RightClick);
         assert_eq!(TrayEvent::Menu(1001), TrayEvent::Menu(1001));
+    }
+
+    #[test]
+    fn menu_item_default_children() {
+        // TrayMenuItem 构造必须显式提供 children（无默认值，防漏建子菜单）
+        let item = TrayMenuItem {
+            id: 2100,
+            label: "Profile A".into(),
+            enabled: true,
+            checked: None,
+            separator: false,
+            children: vec![TrayMenuItem {
+                id: 2101,
+                label: "Sub".into(),
+                enabled: true,
+                checked: None,
+                separator: false,
+                children: Vec::new(),
+            }],
+        };
+        assert_eq!(item.children.len(), 1);
+        assert_eq!(item.children[0].id, 2101);
     }
 
     #[test]

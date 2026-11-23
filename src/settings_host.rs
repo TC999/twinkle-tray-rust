@@ -38,6 +38,11 @@ pub fn open_settings_window(
 
     wire_callbacks(&ui, settings.clone(), host.clone());
     ui.show().map_err(|e| e.to_string())?;
+
+    // 设置窗口打开即检查更新（equiv SettingsWindow componentDidMount L211 window.checkForUpdates()）
+    let snapshot = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
+    crate::update_host::check_for_updates(&snapshot, false, update_path());
+
     Ok(SettingsWindowHandle { ui })
 }
 
@@ -244,6 +249,18 @@ fn apply_side_effects(host: &Arc<crate::monitor_host::MonitorHost>, key: &str, s
         // 只影响滑块映射，读回亮度即可（equiv L1404-L1408）
         host.refresh_monitors(false, true);
     }
+
+    // checkForUpdates 开关（equiv L1376-L1383）
+    if key == "checkForUpdates" {
+        let enabled = settings.get("checkForUpdates").and_then(|v| v.as_bool()).unwrap_or(true);
+        if enabled {
+            // 开启:lastCheck=false 允许重新检查（Rust 侧直接触发一次非强制检查）
+            crate::update_host::check_for_updates(settings, false, update_path());
+        } else {
+            // 关闭:latestVersion=false 清 UI
+            crate::update_host::clear_update();
+        }
+    }
 }
 
 /// 数值型设置键（equiv 原版的 target.value * 1 语义）。
@@ -411,13 +428,39 @@ fn handle_settings_button(
             host.send(json!({"type": "getReport"}));
         }
         "check-for-updates" => {
-            // 更新检查走 WinHTTP（§1.2 已定方案），由 update 模块处理
+            // equiv L5184-L5188:latestVersion.error=false + checkForUpdates(true)
+            let snapshot = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
+            crate::update_host::check_for_updates(&snapshot, true, update_path());
         }
         "get-coordinates" => {
             // equiv L5893 getAndApplyUserCoordinates：按 IP 定位后写入经纬度
+            let snap = settings.clone();
+            std::thread::spawn(move || {
+                match crate::net::fetch_geo_coordinates() {
+                    Some((lat, long)) => {
+                        let mut guard = match snap.lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        guard["adjustmentTimeLatitude"] = json!(lat.parse::<f64>().unwrap_or(0.0));
+                        guard["adjustmentTimeLongitude"] = json!(long.parse::<f64>().unwrap_or(0.0));
+                    }
+                    None => {
+                        println!("Couldn't get coordinates.");
+                    }
+                }
+            });
         }
         _ => {}
     }
+}
+
+/// updatePath（equiv L114：configFilesDir/update.exe）。
+fn update_path() -> std::path::PathBuf {
+    std::env::var("TT_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("update.exe")
 }
 
 /// 设置窗口文案。

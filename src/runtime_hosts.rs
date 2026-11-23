@@ -950,6 +950,14 @@ pub fn handle_background_update(rt: &RuntimeHost, force: bool, tz_offset: i64) {
     if has_times && !rt.user_idle_dimmed.load(Ordering::SeqCst) {
         apply_current_adjustment_event(rt, force, false, tz_offset);
     }
+    // equiv L5850:if (!force) checkForUpdates()（forced update 只修亮度,不做更新检查）
+    if !force {
+        let update_path = std::env::var("TT_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("update.exe");
+        crate::update_host::check_for_updates(&settings, false, update_path);
+    }
 }
 
 // ---------------------------------------------------------------------------

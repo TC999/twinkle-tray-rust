@@ -198,11 +198,11 @@ cargo test --workspace: 96 个测试用例全部通过（12 crate + suncalc 新�
 - [x] ~~Slint UI（panel / settings / intro / hud 四窗口）~~（Round 5 实质化完成，见上）
 - [x] ~~HDR~~（并入 displayconfig，Round 4 完成；DisplayConfigSetDeviceInfo 真机 nits=80 对拍通过）
 
-### 剩余可深化项（不影响 §4 映射完整性）
+### 剩余可深化项（不影响 §4 映射完整性）✅ 全部完成（Round 7 · 2026-11-23）
 
-- [ ] 托盘 HMENU 子菜单层级（profiles 视觉层级；当前平铺等价）
-- [ ] 原生亮度键长按重复（NATIVE_BRIGHTNESS_KEY_REPEAT_INTERVAL=120ms；当前单发等价）
-- [ ] GA4 埋点/更新检查的网络路径（WinHTTP 等价移植，§1.2）
+- [x] ~~托盘 HMENU 子菜单层级~~（TrayMenuItem.children 递归子菜单 + profiles 的 SETTINGS_PROFILES_TITLE 子菜单 + DEBUG 子菜单全项）
+- [x] ~~原生亮度键长按重复~~（SystemEvents 状态机：400ms 延迟 + 120ms 周期 + 10000ms 上限 + Raw Input 注册补齐）
+- [x] ~~GA4 埋点/更新检查的网络路径~~（WinHTTP 等价移植，§1.2）
 
 ## settings 兼容层 ✅
 
@@ -270,3 +270,36 @@ cargo test --manifest-path crates/twutils/Cargo.toml -- --nocapture
 # 本地化校验
 node tools/convert-localization.mjs --check
 ```
+## 剩余可深化项完成记录（Round 7 · 2026-11-23）
+
+### 1. 托盘 HMENU 子菜单层级
+- `crates/tray/src/tray_icon.rs`：`TrayMenuItem.children: Vec<TrayMenuItem>`，`append_items()` 递归构建
+  （MF_POPUP=0x10 追加子菜单句柄；子菜单项点击时 TrackPopupMenu 返回其 id，路由不变）
+- `src/main.rs build_tray_menu`：profiles 改为 `SETTINGS_PROFILES_TITLE` 子菜单（id 仍 2100+）；
+  DEBUG 改为完整 10 项子菜单（RESTART PANEL/RECREATE TRAY/MINIMIZE PANEL/HIDE PANEL/OPACITY 0-1/
+  DO CURRENT TOD/REMOVE ACRYLIC/PAUSE MOUSE/LAST ACTIVE WIN，id 2004-2013）
+- 单测：`menu_item_default_children`
+
+### 2. 原生亮度键长按重复（equiv electron.js L627-L714）
+- 常量 NATIVE_BRIGHTNESS_KEY_REPEAT_LIMIT=10000 / REPEAT_INTERVAL=120 / 400ms 启动延迟（逐字对照 L636-L639）
+- `SystemEvents` 状态机字段：native_key / native_repeat_delay_due / native_repeat_interval_due / native_repeat_until；
+  tick 驱动（equiv L683-L688 的 setTimeout/setInterval）
+- **补齐 Raw Input 注册**（此前缺失）：`sync_native_brightness_keys()` 按是否配置 BrightnessUp/Down 热键
+  注册/注销；`apply_hotkeys` 跳过 BrightnessUp/Down 的 RegisterHotKeyW（equiv L1811-L1815）
+- 单测：`native_key_release_clears_state` / `native_key_non_updown_ignored`
+
+### 3. GA4 埋点 / 更新检查 / 坐标（WinHTTP 等价移植，§1.2 预定方案）
+- `src/net.rs`：WinHTTP 同步内核（Open→Connect→OpenRequest→SendRequest→ReceiveResponse→ReadData）；
+  状态码 WINHTTP_QUERY_STATUS_CODE|FLAG_NUMBER（status=0 bug 修复）、自定义头 WINHTTP_QUERY_CUSTOM；
+  URL 手写解析（http/https）
+- `ping_analytics`（ga4-mp GA_ENDPOINT 等价）/ `fetch_github_releases` / `fetch_geo_coordinates` / `os_release`
+- `src/update_host.rs`：UpdateState 单例 + check_for_updates（getVersionValue 比较 + branch prerelease 过滤 +
+  dismissedUpdate）+ download_and_install（流式下载 + 大小校验 + DETACHED_PROCESS spawn）+ ignore/clear
+- 接线：settings 按钮 check-for-updates/get-coordinates；设置窗口打开即检查（L211 等价）；
+  background 60s 检查（L5850 等价）；checkForUpdates 开关响应（L1376-L1383 等价）；面板更新条 install/dismiss + tick 轮询；
+  SystemEvents analytics 29min 周期 + 28min 最小间隔 + 开关变化重启（L1429-L1440 等价）
+- 单测：net（url_parsing/wide_conversion）+ update_host（version_value/find_latest_release 三分支）
+- 真机验证：GitHub API 200（141KB）/ 坐标 X-Geo-Lat=22.9481 X-Geo-Long=113.9276 /
+  beta 分支找到 v1.18.0-beta2（current 同版本不显示，等价 L5054）/ master 跳过 prerelease 无更新
+
+**质量状态（Round 7）**：cargo build --workspace 零错误零警告；cargo test --workspace 104 个测试全部通过

@@ -631,14 +631,32 @@ fn wire_callbacks(
     });
 
     // 更新条（equiv installUpdate / dismissUpdate）
+    // install:下载 + 运行安装器（equiv preload installUpdate -> get-update L3670）
     let s4 = state.clone();
     panel.on_install_update(move || {
-        let st = s4.borrow();
-        let _ = st.settings.get("dismissedUpdate");
+        let up = crate::update_host::snapshot();
+        if up.download_url.is_empty() {
+            return;
+        }
+        // equiv L3671:latestVersion.error = false
+        crate::update_host::clear_error();
+        // clear-update（equiv preload L181）
+        crate::update_host::clear_update();
+        let update_path = std::env::var("TT_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("update.exe");
+        crate::update_host::download_and_install(&up.download_url, up.filesize, update_path);
+        let _ = s4;
     });
-    let s5 = state.clone();
+    // dismiss:写 dismissedUpdate + 清 show（equiv preload dismissUpdate -> ignore-update L5190）
+    let snap = settings.clone();
     panel.on_dismiss_update(move || {
-        let _ = s5.borrow();
+        let version = crate::update_host::snapshot().version;
+        if let Ok(mut guard) = snap.lock() {
+            guard["dismissedUpdate"] = json!(version);
+        }
+        crate::update_host::ignore_update(&version);
     });
 }
 
@@ -994,8 +1012,20 @@ fn tick(
     // 3) 冲刷待发送命令到 worker（equiv monitorsThread.send）
     flush_pending(state, &controller.host);
 
+    // 3b) 更新条状态（equiv latest-version / updateProgress 事件推送）
+    refresh_update_bar(ui);
+
     // 4) 刷新 UI model
     refresh_ui(ui, state);
+}
+
+/// 刷新面板更新条（读取 update_host 共享状态;equiv panel-preload 的 latest-version/updateProgress 监听）。
+fn refresh_update_bar(ui: &crate::PanelWindow) {
+    let up = crate::update_host::snapshot();
+    ui.set_update_version(up.version.clone().into());
+    ui.set_update_visible(up.show && !up.version.is_empty());
+    ui.set_update_downloading(up.downloading);
+    ui.set_update_progress(up.progress as f32);
 }
 
 /// 托盘事件处理（equiv toggleTray / setTrayMenu 的 click 回调）。
@@ -1061,6 +1091,58 @@ fn handle_tray_event(
             2003 => {
                 ui.invoke_refresh_requested();
                 controller.host.refresh_monitors(true, true);
+            }
+            // ---- DEBUG 子菜单（equiv getDebugTrayMenuItems L4683-L4698；仅 isDev 可见）----
+            // 2004：RESTART PANEL（equiv restartPanel）——Rust 侧无持久窗口重建，等价重新请求全量刷新
+            2004 => {
+                controller.host.refresh_monitors(true, true);
+            }
+            // 2005：RECREATE TRAY（equiv recreateTray）——托盘常驻线程无重建语义，仅日志
+            2005 => {
+                println!("DEBUG: RECREATE TRAY (tray thread resident; no-op)");
+            }
+            // 2006：MINIMIZE PANEL（equiv mainWindow.minimize）
+            2006 => {
+                let _ = ui.window().set_minimized(true);
+            }
+            // 2007：HIDE PANEL（equiv showPanel(false)）
+            2007 => {
+                let _ = ui.hide();
+                state.borrow_mut().visible = false;
+            }
+            // 2008/2009：OPACITY 0/1（equiv setOpacity）——Slint 无透明度 API，降级为日志
+            2008 => {
+                println!("DEBUG: OPACITY 0 (Slint unsupported; no-op)");
+            }
+            2009 => {
+                println!("DEBUG: OPACITY 1 (Slint unsupported; no-op)");
+            }
+            // 2010：DO CURRENT TOD（equiv applyCurrentAdjustmentEvent(true)）
+            2010 => {
+                let rt = controller.runtime();
+                if let Some(rt) = rt {
+                    let tz = crate::system_events::timezone_offset_minutes();
+                    crate::runtime_hosts::apply_current_adjustment_event(&rt, true, false, tz);
+                }
+            }
+            // 2011：REMOVE ACRYLIC（equiv tryVibrancy(mainWindow, false)）——
+            // Slint 侧窗口材质由主题刷新驱动，此处更新设置后经 apply_theme 生效
+            2011 => {
+                let rt = controller.runtime();
+                if let Some(rt) = rt {
+                    rt.update_settings(json!({ "useAcrylic": false }));
+                    let settings = rt.settings_snapshot();
+                    crate::window_state::apply_theme(ui, &settings);
+                    println!("DEBUG: REMOVE ACRYLIC");
+                }
+            }
+            // 2012：PAUSE MOUSE（equiv pauseMouseEvents(true)）——滚动快捷未移植，仅日志
+            2012 => {
+                println!("DEBUG: PAUSE MOUSE (scroll shortcut not ported; no-op)");
+            }
+            // 2013：LAST ACTIVE WIN（equiv trySetForegroundWindow(forcedFocusID)）——无强制前台状态，仅日志
+            2013 => {
+                println!("DEBUG: LAST ACTIVE WIN (forced focus not ported; no-op)");
             }
             // 2100+：应用 profile（equiv applyProfileBrightness;亮度档案的 setBrightness 应用）
             id if id >= 2100 => {

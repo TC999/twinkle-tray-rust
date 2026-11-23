@@ -40,6 +40,11 @@ fn main() {
     paths.ensure_config_dir();
     app::remove_old_debug_log(&paths);
 
+    // 进程级配置目录快照（settings_host 的 update_path / 更新下载用;equiv updatePath 定义）
+    // SAFETY: 主进程单线程启动阶段,set_var 在 spawn 前调用,无并发访问
+    std::env::set_var("TT_CONFIG_DIR", &paths.config_dir);
+    std::env::set_var("TT_USER_DATA", &paths.user_data);
+
     // readSettings：读取 + 版本迁移（equiv L1009-L1199）
     let settings = monitor_thread_manager::read_and_migrate_settings(
         &paths.settings_path,
@@ -164,6 +169,9 @@ fn main() {
     // 全局热键（equiv applyHotkeys）：注册在托盘线程消息窗口上
     start_hotkeys(&settings, &mut system);
 
+    // analytics 埋点（equiv L1429-L1440：settings.analytics 开关 + 29min 周期）
+    system.sync_analytics(&settings);
+
     // 主进程 UI（主线程 = Slint 事件循环，AGENTS.md §5）
     if let Err(e) = twinkle_tray_rust::run_panel(
         host.clone(),
@@ -284,6 +292,7 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
             enabled: true,
             checked: Some(temp.pause_time_adjustments),
             separator: false,
+            children: Vec::new(),
         });
     }
     // getDetectIdleMenuItem（equiv L4658-L4663）
@@ -298,6 +307,7 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
             enabled: true,
             checked: Some(temp.pause_idle_detection),
             separator: false,
+            children: Vec::new(),
         });
     }
     // getProfilesMenuItem（equiv L4665-L4681:showInMenu && setBrightness 的 profile 平铺）
@@ -316,16 +326,26 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
         }
     }
     if !profile_items.is_empty() {
-        // 无子菜单 HMENU 支持,平铺为 id 2100+ 项(视觉与行为等价:点击应用 profile)
-        for (id, name) in &profile_items {
-            items.push(tray::TrayMenuItem {
+        // SETTINGS_PROFILES_TITLE 子菜单（equiv getProfilesMenuItem L4676 的 submenu）
+        let children: Vec<tray::TrayMenuItem> = profile_items
+            .iter()
+            .map(|(id, name)| tray::TrayMenuItem {
                 id: *id,
                 label: name.clone(),
                 enabled: true,
                 checked: None,
                 separator: false,
-            });
-        }
+                children: Vec::new(),
+            })
+            .collect();
+        items.push(tray::TrayMenuItem {
+            id: 0,
+            label: tt_localize::t("SETTINGS_PROFILES_TITLE"),
+            enabled: true,
+            checked: None,
+            separator: false,
+            children,
+        });
     }
     // getPausableSeparatorMenuItem（equiv L4644-L4649）
     if idle_enabled || has_tod || !profile_items.is_empty() {
@@ -335,6 +355,7 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
             enabled: true,
             checked: None,
             separator: true,
+            children: Vec::new(),
         });
     }
     // refresh displays（equiv L4635）
@@ -344,6 +365,7 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
         enabled: true,
         checked: None,
         separator: false,
+        children: Vec::new(),
     });
     // settings（equiv L4636）
     items.push(tray::TrayMenuItem {
@@ -352,6 +374,7 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
         enabled: true,
         checked: None,
         separator: false,
+        children: Vec::new(),
     });
     // separator
     items.push(tray::TrayMenuItem {
@@ -360,30 +383,50 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
         enabled: true,
         checked: None,
         separator: true,
+        children: Vec::new(),
     });
-    // getDebugTrayMenuItems（equiv L4683-L4698:isDev 时显示）
+    // getDebugTrayMenuItems（equiv L4683-L4698:isDev 时显示）——改为 DEBUG 子菜单
     let is_dev = settings.get("isDev").and_then(|v| v.as_bool()).unwrap_or(false);
     if is_dev {
-        items.push(tray::TrayMenuItem {
-            id: 2004,
-            label: "DEBUG: RESTART PANEL".to_string(),
+        let debug_children: Vec<tray::TrayMenuItem> = [
+            // RESTART PANEL（equiv restartPanel）：等价重建面板窗口，当前实现无持久窗口，
+            // 以重新下发刷新触发等价行为（记录于面板控制器）
+            (2004, "RESTART PANEL"),
+            // RECREATE TRAY（equiv recreateTray）：托盘常驻线程，无重建语义，保留 id 供路由
+            (2005, "RECREATE TRAY"),
+            // MINIMIZE PANEL（equiv mainWindow.minimize）：面板最小化
+            (2006, "MINIMIZE PANEL"),
+            // HIDE PANEL（equiv showPanel(false)）
+            (2007, "HIDE PANEL"),
+            // OPACITY 0 / OPACITY 1（equiv setOpacity）
+            (2008, "OPACITY 0"),
+            (2009, "OPACITY 1"),
+            // DO CURRENT TOD（equiv applyCurrentAdjustmentEvent(true)）
+            (2010, "DO CURRENT TOD"),
+            // REMOVE ACRYLIC（equiv tryVibrancy(mainWindow, false)）
+            (2011, "REMOVE ACRYLIC"),
+            // PAUSE MOUSE（equiv pauseMouseEvents(true)）
+            (2012, "PAUSE MOUSE"),
+            // LAST ACTIVE WIN（equiv trySetForegroundWindow）
+            (2013, "LAST ACTIVE WIN"),
+        ]
+        .iter()
+        .map(|(id, label)| tray::TrayMenuItem {
+            id: *id,
+            label: label.to_string(),
             enabled: true,
             checked: None,
             separator: false,
-        });
+            children: Vec::new(),
+        })
+        .collect();
         items.push(tray::TrayMenuItem {
-            id: 2005,
-            label: "DEBUG: HIDE PANEL".to_string(),
+            id: 0,
+            label: "DEBUG".to_string(),
             enabled: true,
             checked: None,
             separator: false,
-        });
-        items.push(tray::TrayMenuItem {
-            id: 2006,
-            label: "DEBUG: APPLY CURRENT TOD".to_string(),
-            enabled: true,
-            checked: None,
-            separator: false,
+            children: debug_children,
         });
     }
     // turn off displays（保留原 1003 语义:原版 monitors 段的 turn off）
@@ -393,6 +436,7 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
         enabled: true,
         checked: None,
         separator: false,
+        children: Vec::new(),
     });
     // quit（equiv L4639）
     items.push(tray::TrayMenuItem {
@@ -401,6 +445,7 @@ fn build_tray_menu() -> Vec<tray::TrayMenuItem> {
         enabled: true,
         checked: None,
         separator: false,
+        children: Vec::new(),
     });
     items
 }

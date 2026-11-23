@@ -13,6 +13,15 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+/// 原生亮度键重复（equiv electron.js L636-L639）。
+const NATIVE_BRIGHTNESS_KEY_REPEAT_LIMIT: u64 = 10000; // Holding the key longer than this needs a fresh press
+const NATIVE_BRIGHTNESS_KEY_REPEAT_INTERVAL: u64 = 120; // Kept clear of doHotkey's 100 ms throttle
+
+/// analytics 周期（equiv L816：1000*60*29）。
+const ANALYTICS_FREQUENCY_MS: u64 = 1000 * 60 * 29;
+/// analytics 最小间隔（equiv L821：1000*60*28）。
+const ANALYTICS_MIN_PING_MS: u64 = 1000 * 60 * 28;
+
 /// 本地时区偏移(分钟,+480 = 东八区)。缓存一次(等价 Date 对象的隐式获取)。
 pub fn timezone_offset_minutes() -> i64 {
     static CACHE: OnceLock<i64> = OnceLock::new();
@@ -116,11 +125,27 @@ pub fn take_hud_request() -> bool {
 
 /// applyHotkeys(equiv L1801-L1831):在托盘线程窗口上注册全部热键。
 /// 返回 (注册表, 成功数)。unregisterAll 语义 = 先注销全部再逐个注册。
+/// 原生亮度键 accelerator 表（equiv nativeBrightnessAccelerators L627-L630）。
+pub const NATIVE_BRIGHTNESS_ACCELERATORS: [&str; 2] = ["BrightnessUp", "BrightnessDown"];
+
+/// applyHotkeys(equiv L1801-L1831):在托盘线程窗口上注册全部热键。
+/// BrightnessUp/Down 不注册为全局热键——由 Raw Input 设备捕获(WM_INPUT)触发,
+/// active 取决于 sync_native_brightness_keys 的注册结果(equiv L1811-L1815)。
 pub fn apply_hotkeys(settings: &Value, tray_hwnd: windows::Win32::Foundation::HWND) -> Vec<hotkey_host::RegisteredHotkey> {
     let parsed = hotkey_host::parse_hotkeys_with_id(settings);
     let mut registered = Vec::new();
+    let mut claimed_native: Vec<String> = Vec::new();
     for (idx, hotkey) in parsed.iter().enumerate() {
         let id_val = (10000 + idx) as i32; // 注册 id 与 accelerator 反查表对齐
+        if NATIVE_BRIGHTNESS_ACCELERATORS.contains(&hotkey.accelerator.as_str()) {
+            // 原生亮度键:不注册 RegisterHotKeyW(equiv L1812-L1814),
+            // 仅由 WM_INPUT 报告触发;active 判定在 trigger 侧按是否存在完成
+            if !claimed_native.contains(&hotkey.accelerator) {
+                claimed_native.push(hotkey.accelerator.clone());
+                registered.push(hotkey.clone());
+            }
+            continue;
+        }
         if let Some((modifiers, vk)) = hotkey_host::accelerator_to_hotkey(&hotkey.accelerator) {
             // 等价 globalShortcut.register 的 try/catch:失败即跳过(hotkey.active=false)
             let ok = tray::register_hotkey(Some(tray_hwnd), id_val, modifiers, vk);
@@ -133,6 +158,20 @@ pub fn apply_hotkeys(settings: &Value, tray_hwnd: windows::Win32::Foundation::HW
     }
     println!("Hotkeys registered: {}/{}", registered.len(), parsed.len());
     registered
+}
+
+/// syncNativeBrightnessKeys(equiv L694-L714):按是否配置了 BrightnessUp/Down 热键
+/// 注册/注销 Raw Input 设备。wanted 变化时重注册。
+pub fn sync_native_brightness_keys(settings: &Value, tray_hwnd: windows::Win32::Foundation::HWND) -> bool {
+    let wanted = hotkey_host::parse_hotkeys(settings)
+        .iter()
+        .any(|(accel, _)| NATIVE_BRIGHTNESS_ACCELERATORS.contains(&accel.as_str()));
+    if wanted {
+        twutils::brightness_keys::register(tray_hwnd)
+    } else {
+        twutils::brightness_keys::unregister();
+        false
+    }
 }
 
 /// 注销全部热键(equiv globalShortcut.unregisterAll)。
@@ -148,28 +187,89 @@ pub fn hotkey_by_reg_id(registrations: &[hotkey_host::RegisteredHotkey], reg_id:
     registrations.get(idx)
 }
 
-/// handleNativeBrightnessKey(equiv L666+):WM_INPUT 原生亮度键。
-/// "up"/"down" 触发 triggerNativeBrightnessHotkey;release 停止重复。
-pub fn handle_native_brightness_key(ctx: &HotkeyContext, registrations: &[hotkey_host::RegisteredHotkey], key: &str) {
-    match key {
-        "release" => { /* stopNativeBrightnessKeyRepeat:重复定时器未实现,等价空 */ }
-        "up" | "down" => {
-            let accelerator = if key == "up" { "BrightnessUp" } else { "BrightnessDown" };
-            trigger_native_brightness_hotkey(ctx, registrations, accelerator);
+/// handleNativeBrightnessKey(equiv L666-L689):WM_INPUT 原生亮度键。
+/// "up"/"down" 触发 triggerNativeBrightnessHotkey 并启动长按重复;"release" 停止。
+/// 重复状态机由 tick 的 drive_native_brightness_key_repeat 驱动(主线程)。
+impl SystemEvents {
+    fn handle_native_brightness_key(&mut self, ctx: &HotkeyContext, key: &str) {
+        // equiv L667-L669:release 停止全部重复定时器
+        if key == "release" {
+            self.stop_native_brightness_key_repeat();
+            return;
         }
-        _ => {}
+        // equiv L671:非 up/down("other"/"")忽略
+        if key != "up" && key != "down" {
+            return;
+        }
+        // equiv L672:同键重复报告忽略(按下状态未释放)
+        if self.native_key.as_deref() == Some(key) {
+            return;
+        }
+        // equiv L674:更换按键先停止旧重复
+        self.stop_native_brightness_key_repeat();
+        self.native_key = Some(key.to_string());
+        let accelerator = if key == "up" { "BrightnessUp" } else { "BrightnessDown" };
+        // equiv L676-L679:触发失败则放弃按下状态
+        if !trigger_native_brightness_hotkey(ctx, &self.registrations, accelerator) {
+            self.native_key = None;
+            return;
+        }
+        // equiv L680-L688:release 报告可能丢失(蓝牙键盘休眠/断连),
+        // 重复在自身超时后停止。
+        self.native_repeat_until = Some(std::time::Instant::now() + Duration::from_millis(NATIVE_BRIGHTNESS_KEY_REPEAT_LIMIT));
+        self.native_repeat_delay_due = Some(std::time::Instant::now() + Duration::from_millis(400));
+    }
+
+    /// stopNativeBrightnessKeyRepeat(equiv L641-L647)。
+    fn stop_native_brightness_key_repeat(&mut self) {
+        self.native_key = None;
+        self.native_repeat_delay_due = None;
+        self.native_repeat_interval_due = None;
+        self.native_repeat_until = None;
+    }
+
+    /// 长按重复驱动(tick 调用;equiv L683-L688 的 setTimeout/setInterval)。
+    fn drive_native_brightness_key_repeat(&mut self, ctx: &HotkeyContext) {
+        // 400ms 延迟到期 -> 启动 120ms 周期
+        if let Some(due) = self.native_repeat_delay_due {
+            if std::time::Instant::now() >= due {
+                self.native_repeat_delay_due = None;
+                self.native_repeat_interval_due =
+                    Some(std::time::Instant::now() + Duration::from_millis(NATIVE_BRIGHTNESS_KEY_REPEAT_INTERVAL));
+            }
+        }
+        let Some(due) = self.native_repeat_interval_due else { return };
+        if std::time::Instant::now() < due {
+            return;
+        }
+        // equiv L685:超过 10000ms 上限则停止
+        if let Some(until) = self.native_repeat_until {
+            if std::time::Instant::now() > until {
+                self.stop_native_brightness_key_repeat();
+                return;
+            }
+        }
+        // equiv L686:仍按住则再次触发
+        if let Some(key) = self.native_key.clone() {
+            let accelerator = if key == "up" { "BrightnessUp" } else { "BrightnessDown" };
+            trigger_native_brightness_hotkey(ctx, &self.registrations, accelerator);
+            self.native_repeat_interval_due =
+                Some(std::time::Instant::now() + Duration::from_millis(NATIVE_BRIGHTNESS_KEY_REPEAT_INTERVAL));
+        }
     }
 }
 
 /// triggerNativeBrightnessHotkey(equiv L649-L664)。
-fn trigger_native_brightness_hotkey(ctx: &HotkeyContext, registrations: &[hotkey_host::RegisteredHotkey], accelerator: &str) {
+/// 返回是否找到并触发了热键(原版 return true/false)。
+fn trigger_native_brightness_hotkey(ctx: &HotkeyContext, registrations: &[hotkey_host::RegisteredHotkey], accelerator: &str) -> bool {
     let rt = &ctx.rt;
     let settings = rt.settings_snapshot();
     let hotkey = registrations.iter().find(|h| h.accelerator == accelerator);
-    let Some(hotkey) = hotkey else { return };
+    let Some(hotkey) = hotkey else { return false };
     // Windows already applies dedicated brightness keys...(原注释,skip offset)
     hotkey_host::do_hotkey(ctx, hotkey, true);
     let _ = settings;
+    true
 }
 
 /// 电源设置事件的 GUID 名映射(equiv twutils get_power_setting_name 的白名单)
@@ -333,6 +433,24 @@ pub struct SystemEvents {
     pub idle_short_due: std::time::Instant,
     /// backgroundInterval(60s / dev 8s)
     pub background_due: std::time::Instant,
+    /// 原生亮度键当前按下的键（"up"/"down"/None;equiv nativeBrightnessKey L633）
+    pub native_key: Option<String>,
+    /// 400ms 重复启动延迟到期（equiv nativeBrightnessKeyRepeatDelay L634）
+    pub native_repeat_delay_due: Option<std::time::Instant>,
+    /// 120ms 周期重复的下次触发（equiv nativeBrightnessKeyRepeat L635）
+    pub native_repeat_interval_due: Option<std::time::Instant>,
+    /// 长按上限到期（equiv repeatUntil L682）
+    pub native_repeat_until: Option<std::time::Instant>,
+    /// Raw Input 注册状态（equiv nativeBrightnessKeysRegistered L631）
+    pub native_brightness_registered: bool,
+    /// 是否需要原生亮度键（equiv nativeBrightnessKeysWanted L694）
+    pub native_brightness_wanted: bool,
+    /// analytics 周期定时（equiv analyticsInterval L815;29 分钟）
+    pub analytics_due: Option<std::time::Instant>,
+    /// 上次 analytics ping（equiv lastAnalyticsPing L817）
+    pub last_analytics_ping: Option<std::time::Instant>,
+    /// analytics 开关上次状态（检测设置变化时重启周期;equiv processSettings L1429-L1440）
+    pub analytics_enabled: bool,
 }
 
 
@@ -376,14 +494,63 @@ impl SystemEvents {
             idle_short_active: false,
             idle_short_due: std::time::Instant::now(),
             background_due: std::time::Instant::now() + Duration::from_secs(60),
+            native_key: None,
+            native_repeat_delay_due: None,
+            native_repeat_interval_due: None,
+            native_repeat_until: None,
+            native_brightness_registered: false,
+            native_brightness_wanted: false,
+            analytics_due: None,
+            last_analytics_ping: None,
+            analytics_enabled: true,
         }
     }
 
     /// 应用热键注册(托盘 hwnd 可用后调用;equiv applyHotkeys)。
     pub fn apply_hotkeys_now(&mut self, settings: &Value) {
         if let Some(hwnd) = self.tray_hwnd {
+            // equiv L1803:applyHotkeys 先 syncNativeBrightnessKeys
+            self.native_brightness_registered = sync_native_brightness_keys(settings, hwnd);
             self.registrations = apply_hotkeys(settings, hwnd);
         }
+    }
+
+    /// syncAnalytics（equiv L1429-L1440：settings.analytics 开关控制周期定时）。
+    pub fn sync_analytics(&mut self, settings: &Value) {
+        let enabled = settings.get("analytics").and_then(|v| v.as_bool()).unwrap_or(true);
+        if enabled {
+            // 立即 ping（等价 L1430 的 pingAnalytics()，内含 28 分钟最小间隔判断）
+            self.ping_analytics_now(settings);
+            self.analytics_due = Some(std::time::Instant::now() + Duration::from_millis(ANALYTICS_FREQUENCY_MS));
+        } else {
+            self.analytics_due = None;
+            self.last_analytics_ping = None;
+        }
+    }
+
+    /// pingAnalytics（equiv L819-L841）。28 分钟最小间隔判断在方法内。
+    fn ping_analytics_now(&mut self, settings: &Value) {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_analytics_ping {
+            if (now.duration_since(last).as_millis() as u64) < ANALYTICS_MIN_PING_MS {
+                return;
+            }
+        }
+        let uuid = settings.get("uuid").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if uuid.is_empty() {
+            return;
+        }
+        self.last_analytics_ping = Some(now);
+        let os = crate::net::os_release();
+        // 网络在独立线程（不阻塞 UI 主线程;等价 fetch 异步）
+        std::thread::spawn(move || {
+            crate::net::ping_analytics(
+                &uuid,
+                crate::app::APP_VERSION,
+                crate::app::APP_BUILD,
+                &os,
+            );
+        });
     }
 
     /// 排空转发队列。
@@ -412,7 +579,7 @@ impl SystemEvents {
                         }
                     }
                     tray::TrayEvent::NativeBrightnessKey(key) => {
-                        handle_native_brightness_key(&ctx, &self.registrations, &key);
+                        self.handle_native_brightness_key(&ctx, &key);
                     }
                     tray::TrayEvent::WmDisplayChange => {
                         // equiv L3888-L3890:useWmDisplayChangeEvent 开关
@@ -527,6 +694,30 @@ impl SystemEvents {
             self.background_due = std::time::Instant::now() + Duration::from_secs(period);
             runtime_hosts::handle_background_update(rt, false, timezone_offset_minutes());
         }
+
+        // ---- analytics(equiv L1429-L1440:开关变化重启周期 + L1434:29min setInterval) ----
+        let settings = rt.settings_snapshot();
+        let analytics_on = settings.get("analytics").and_then(|v| v.as_bool()).unwrap_or(true);
+        if analytics_on != self.analytics_enabled {
+            // 开关变化:重启 interval（等价 clearInterval + 立即 ping + 新 interval）
+            self.analytics_enabled = analytics_on;
+            if analytics_on {
+                self.ping_analytics_now(&settings);
+                self.analytics_due = Some(std::time::Instant::now() + Duration::from_millis(ANALYTICS_FREQUENCY_MS));
+            } else {
+                self.analytics_due = None;
+                self.last_analytics_ping = None;
+            }
+        }
+        if let Some(due) = self.analytics_due {
+            if std::time::Instant::now() >= due {
+                self.ping_analytics_now(&settings);
+                self.analytics_due = Some(std::time::Instant::now() + Duration::from_millis(ANALYTICS_FREQUENCY_MS));
+            }
+        }
+
+        // ---- 原生亮度键长按重复驱动(equiv L683-L688 的定时器) ----
+        self.drive_native_brightness_key_repeat(&ctx);
     }
 }
 
@@ -600,4 +791,46 @@ fn drain_display_events() -> usize {
         Err(_) => 0,
     };
     count
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_hosts::RuntimeHost;
+    use crate::monitor_host::MonitorHost;
+    use std::sync::Arc;
+
+    fn test_ctx(rt: Arc<RuntimeHost>) -> HotkeyContext {
+        HotkeyContext { rt, throttle: crate::system_events::shared_throttle() }
+    }
+
+    #[test]
+    fn native_key_release_clears_state() {
+        // 未找到热键时 trigger 返回 false,不启动重复(等价 L676-L679)
+        let mut sys = SystemEvents::new(None);
+        let rt = runtime_host();
+        let ctx = test_ctx(rt);
+        sys.handle_native_brightness_key(&ctx, "up");
+        assert!(sys.native_key.is_none());
+        assert!(sys.native_repeat_delay_due.is_none());
+        assert!(sys.native_repeat_until.is_none());
+    }
+
+    #[test]
+    fn native_key_non_updown_ignored() {
+        let mut sys = SystemEvents::new(None);
+        let rt = runtime_host();
+        let ctx = test_ctx(rt);
+        sys.handle_native_brightness_key(&ctx, "other");
+        sys.handle_native_brightness_key(&ctx, "");
+        sys.handle_native_brightness_key(&ctx, "release");
+        assert!(sys.native_key.is_none());
+    }
+
+    fn runtime_host() -> Arc<RuntimeHost> {
+        let host = MonitorHost::new("test.exe".into(), ".".into());
+        let settings = Arc::new(Mutex::new(json!({})));
+        RuntimeHost::new(host, settings, std::path::PathBuf::from("known.json"))
+    }
 }
