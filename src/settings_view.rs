@@ -80,6 +80,26 @@ impl ItemBuilder {
         self
     }
 
+    /// 原版硬编码英文标题的开关（equiv SettingsWindow.jsx L1417-L1422 的
+    /// `<SettingsChild title={"Apple Studio Displays"} .../>`）。
+    ///
+    /// 源语料里没有这些标题的 FTL 键（原版就是字面量），所以**不能**走
+    /// `tt_localize::t()`：查不到键会经 en.ftl 回退链返回空串，表现为
+    /// 「开关有圆钮、没有文字」。
+    fn toggle_literal(&mut self, key: &str, title: &str, settings: &Value) -> &mut Self {
+        self.items.push(SettingsItem {
+            kind: SettingsItemKind::Toggle,
+            key: key.into(),
+            title: title.into(),
+            toggle_value: settings
+                .get(key)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            ..Default::default()
+        });
+        self
+    }
+
     /// 下拉（equiv <select>）：options 为 (value, label) 列表。
     /// ComboBox 的 model 只接受字符串，故拆成同序的 values/labels 两个数组；
     /// selected 回调传显示文本，宿主侧按 labels 位置映射回 values。
@@ -381,12 +401,14 @@ fn general_page(b: &mut ItemBuilder, s: &Value) {
 
     // 故障排查（equiv L1414-L1459）
     b.section(&tt_localize::t("SETTINGS_GENERAL_TROUBLESHOOTING"));
-    b.toggle("disableAppleStudio", "Apple Studio Displays", "", s);
-    b.toggle("disableHighLevel", "DDC/CI HL", "", s);
-    b.toggle("disableHDR", "HDR", "", s);
-    b.toggle("disableWMIC", "WMIC", "", s);
-    b.toggle("disableWMI", "WMI-Bridge", "", s);
-    b.toggle("disableWin32", "Win32-DisplayConfig", "", s);
+    // 六项在原版 SettingsWindow.jsx L1417-L1422 是硬编码英文标题（无 FTL 键），
+    // 必须用 toggle_literal 直接给字面量，否则标题会被当成缺失的键翻成空串。
+    b.toggle_literal("disableAppleStudio", "Apple Studio Displays", s);
+    b.toggle_literal("disableHighLevel", "DDC/CI HL", s);
+    b.toggle_literal("disableHDR", "HDR", s);
+    b.toggle_literal("disableWMIC", "WMIC", s);
+    b.toggle_literal("disableWMI", "WMI-Bridge", s);
+    b.toggle_literal("disableWin32", "Win32-DisplayConfig", s);
     b.select(
         "defaultOverlayType",
         "SETTINGS_GENERAL_OVERLAY_TITLE",
@@ -947,6 +969,28 @@ mod tests {
         // 开关值来自 settings
         let toggle = items.iter().find(|i| i.key == "openAtLogin").unwrap();
         assert!(toggle.toggle_value);
+    }
+
+    #[test]
+    fn troubleshooting_toggles_keep_literal_titles() {
+        // equiv SettingsWindow.jsx L1417-L1422：这六项标题在原版就是硬编码字面量，
+        // 走 t() 会因源语料无对应键而得到空串（表现为「开关无字」）。
+        let items = build_items("general", &json!({}));
+        for (key, title) in [
+            ("disableAppleStudio", "Apple Studio Displays"),
+            ("disableHighLevel", "DDC/CI HL"),
+            ("disableHDR", "HDR"),
+            ("disableWMIC", "WMIC"),
+            ("disableWMI", "WMI-Bridge"),
+            ("disableWin32", "Win32-DisplayConfig"),
+        ] {
+            let item = items.iter().find(|i| i.key == key).unwrap();
+            assert_eq!(item.title.as_str(), title, "{} 标题丢失", key);
+        }
+        // 整页任何设置项都不该渲染成无文字的空行。
+        for item in &items {
+            assert!(!item.title.is_empty(), "{} 标题为空", item.key);
+        }
     }
 
     #[test]

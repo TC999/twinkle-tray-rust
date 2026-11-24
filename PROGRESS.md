@@ -611,3 +611,35 @@ PostMessage(TwinkleTrayTrayClass, WM_TRAY_ICON/WM_LBUTTONUP)
 `cargo test --workspace` 全绿：新增 `select_resolves_current_index`、
 `select_items_carry_aligned_options`；其余 54+ 用例（含 settings_view/settings_host 全部）
 0 失败。`cargo build --workspace` 零错误。
+
+## Round 13 · 2026-11-24：修复「疑难解答」6 个开关无字
+
+### 症状
+
+设置 → 通用 →「疑难解答」下 6 个开关（Apple Studio Displays / DDC/CI HL / HDR /
+WMIC / WMI-Bridge / Win32-DisplayConfig）只有右侧圆钮，左侧标题整行为空。
+
+### 根因
+
+`general_page` 把这 6 项的原版硬编码英文标题（`SettingsWindow.jsx` L1417-L1422 的
+`<SettingsChild title={"Apple Studio Displays"} .../>`）当作 i18n key 传给
+`tt_localize::t()`。源语料无对应键 → 经 en.ftl 回退链返回空串 → `SettingsRow`
+渲染空标题（`ui/settings.slint` L223-L228 直接 `text: item.title`）。
+
+### 修复
+
+`src/settings_view.rs` 新增 `ItemBuilder::toggle_literal(key, title, settings)`，
+直接写入字面量标题、不经本地化；6 项改用该方法。语义与原版一致（原版所有语言下
+这 6 个标题都是英文硬编码，未纳入本地化语料）。
+
+### 对拍验证
+
+真机 `--ui-demo` 切 general 页，滚动到「疑难解答」：6 个开关标题分别显示
+`Apple Studio Displays` / `DDC/CI HL` / `HDR` / `WMIC` / `WMI-Bridge` /
+`Win32-DisplayConfig`，右侧开关控件正常，点击路径不变（settings_host 副作用链未改）。
+
+### 回归测试
+
+新增 `troubleshooting_toggles_keep_literal_titles`：断言 6 项标题逐字匹配原版、
+且 general 页不存在空标题项。`cargo test --lib` 55 passed / 0 failed；
+`cargo build` 零错误。
