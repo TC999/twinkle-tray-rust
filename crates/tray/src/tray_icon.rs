@@ -7,20 +7,25 @@
 //! 点击/菜单事件经 channel 回传主线程（Slint 事件循环）处理。
 
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use windows::core::{BOOL, PCSTR, w};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use crate::hotkey::WM_HOTKEY;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS, NIF_ICON, NIF_MESSAGE, NIF_TIP,
     NIM_ADD, NIM_DELETE, NOTIFY_ICON_MESSAGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, LoadImageW, PostMessageW, RegisterClassW,
-    SetForegroundWindow, TrackPopupMenu, GDI_IMAGE_TYPE, HICON, IMAGE_FLAGS, LR_LOADFROMFILE, MF_STRING,
-    MENU_ITEM_FLAGS, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WM_LBUTTONUP, WM_RBUTTONUP,
-    WINDOW_EX_STYLE, WINDOW_STYLE,
+    AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetClassNameW, GetCursorPos, GetMessageW, LoadImageW,
+    PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowsHookExW, TrackPopupMenu,
+    UnhookWindowsHookEx, GDI_IMAGE_TYPE, HICON, IMAGE_FLAGS, LR_LOADFROMFILE, MF_STRING,
+    MENU_ITEM_FLAGS, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, WH_CBT,
+    WM_LBUTTONUP, WM_RBUTTONUP, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 
 /// 托盘图标配置。
@@ -275,6 +280,136 @@ unsafe fn append_items(hmenu: windows::Win32::UI::WindowsAndMessaging::HMENU, it
     }
 }
 
+/// 托盘菜单是否用深色（equiv 原版 Electron 菜单跟随 nativeTheme 深浅色）。
+/// 读注册表 AppsUseLightTheme：系统用深色应用模式（=0）时菜单为深色；
+/// 读不到时按深色处理（与本机默认行为一致）。注意这是系统级应用模式，
+/// 不随应用内主题设置的 light/dark 覆盖项变化——原版 Electron 菜单同样如此。
+fn menu_uses_dark_mode() -> bool {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD,
+    };
+    let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16()
+        .collect();
+    let value_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+    // SAFETY: 子键/值名为合法 NUL 结尾宽字符串；句柄在使用后立即关闭。
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR::from_raw(subkey.as_ptr()),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+        .is_err()
+        {
+            return true;
+        }
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let mut ty = REG_DWORD;
+        let ok = RegQueryValueExW(
+            key,
+            windows::core::PCWSTR::from_raw(value_name.as_ptr()),
+            None,
+            Some(&mut ty),
+            Some(&mut data as *mut u32 as *mut u8),
+            Some(&mut size),
+        )
+        .is_ok();
+        let _ = RegCloseKey(key);
+        !ok || data == 0
+    }
+}
+
+/// CBT 钩子期间是否要深色菜单（钩子过程是静态函数，经此标志传递）。
+static MENU_DARK_MODE: AtomicBool = AtomicBool::new(false);
+
+/// HCBT_CREATEWND = 3（窗口创建通知）。
+const HCBT_CREATEWND: i32 = 3;
+/// Win32 弹出菜单窗口的类名。
+const MENU_CLASS: &str = "#32768";
+
+/// uxtheme 未公开 API（Win10 1809+/Win11 均存在）：深色模式策略开关。
+/// 仅设 DWMWA_USE_IMMERSIVE_DARK_MODE 只影响窗口框架，菜单内容由 uxtheme
+/// 按"应用深色策略"绘制——必须先 SetPreferredAppMode(AllowDark) 打开策略，
+/// 再对菜单窗口 AllowDarkModeForWindow + DWM 属性（Electron/Chromium 同款配方）。
+/// ordinal：104 RefreshImmersiveColorPolicyState、133 AllowDarkModeForWindow、
+/// 135 SetPreferredAppMode（均 1903+；缺失时按浅色菜单降级，不影响功能）。
+struct UxthemeDark {
+    /// FreeLibrary 不做：模块随进程常驻，避免每次弹菜单重新 LoadLibrary。
+    /// 字段本身不读取，仅为持有句柄阻止卸载。
+    #[allow(dead_code)]
+    module: isize,
+    set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32,
+    allow_dark_mode_for_window: unsafe extern "system" fn(HWND, BOOL) -> BOOL,
+    refresh_immersive_color_policy_state: unsafe extern "system" fn(),
+}
+
+/// PreferredAppMode::AllowDark（跟随系统）/ Default（恢复）。
+const APP_MODE_ALLOW_DARK: i32 = 1;
+const APP_MODE_DEFAULT: i32 = 0;
+
+unsafe impl Send for UxthemeDark {}
+unsafe impl Sync for UxthemeDark {}
+
+static UXTHEME_DARK: OnceLock<Option<UxthemeDark>> = OnceLock::new();
+
+fn uxtheme_dark() -> &'static Option<UxthemeDark> {
+    UXTHEME_DARK.get_or_init(|| unsafe {
+        // SAFETY: LoadLibraryW/GetProcAddress 常规用法；ordinal 以 MAKEINTRESOURCE
+        // 语义传入（指针值即 ordinal）。函数签名按微软未公开 ABI 的公开共识，
+        // 调用失败仅表现为菜单保持浅色，无崩溃风险（参数均为值类型）。
+        let module = LoadLibraryW(w!("uxtheme.dll")).ok()?;
+        let get = |ord: u16| -> Option<*const ()> {
+            // FARPROC = Option<fn()>，找不到 ordinal 时为 None
+            GetProcAddress(module, PCSTR::from_raw(ord as usize as *const u8))
+                .map(|f| f as *const ())
+        };
+        let (Some(a), Some(b), Some(c)) = (
+            get(135),
+            get(133),
+            get(104),
+        ) else {
+            return None;
+        };
+        Some(UxthemeDark {
+            module: module.0 as isize,
+            set_preferred_app_mode: std::mem::transmute::<*const (), unsafe extern "system" fn(i32) -> i32>(a),
+            allow_dark_mode_for_window: std::mem::transmute::<*const (), unsafe extern "system" fn(HWND, BOOL) -> BOOL>(b),
+            refresh_immersive_color_policy_state: std::mem::transmute::<*const (), unsafe extern "system" fn()>(c),
+        })
+    })
+}
+
+/// CBT 钩子：拦截 TrackPopupMenu 即将创建的菜单窗口（类 #32768），
+/// AllowDarkModeForWindow + DWMWA_USE_IMMERSIVE_DARK_MODE 让 uxtheme 用深色渲染
+/// （equiv Electron/Chromium 的 dark 菜单窗口处理）。
+unsafe extern "system" fn menu_cbt_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HCBT_CREATEWND && MENU_DARK_MODE.load(Ordering::Relaxed) {
+        let hwnd = HWND(wparam.0 as *mut core::ffi::c_void);
+        let expect: Vec<u16> = MENU_CLASS.encode_utf16().collect();
+        let mut buf = [0u16; 32];
+        let n = GetClassNameW(hwnd, &mut buf) as usize;
+        if n == expect.len() && buf[..n] == expect[..] {
+            if let Some(ux) = uxtheme_dark() {
+                // SAFETY: hwnd 为钩子通报的合法菜单窗口；签名按 uxtheme 未公开 ABI。
+                let _ = (ux.allow_dark_mode_for_window)(hwnd, BOOL(1));
+            }
+            let on = BOOL(1);
+            // SAFETY: hwnd 为钩子通报的合法菜单窗口；lpdata 指向有效 BOOL。
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &on as *const BOOL as *const core::ffi::c_void,
+                std::mem::size_of::<BOOL>() as u32,
+            );
+        }
+    }
+    CallNextHookEx(None, code, wparam, lparam)
+}
+
 /// 弹出托盘菜单（equiv setTrayMenu 的 TrackPopupMenu）。
 unsafe fn show_menu(hwnd: HWND) {
     let items = menu_slot().lock().map(|g| g.clone()).unwrap_or_default();
@@ -284,6 +419,23 @@ unsafe fn show_menu(hwnd: HWND) {
     let _ = GetCursorPos(&mut pt);
     // 菜单弹出前必须把窗口置前，否则点击外部不会关闭（Win32 托盘菜单惯例）
     let _ = SetForegroundWindow(hwnd);
+    // 深色菜单：uxtheme 深色策略须在菜单窗口创建前开启，DWM 属性须在创建时生效
+    // —— TrackPopupMenu 同步创建菜单窗口，故先开策略，再装线程级 CBT 钩子拦截创建。
+    let dark = menu_uses_dark_mode();
+    MENU_DARK_MODE.store(dark, Ordering::Relaxed);
+    if dark {
+        if let Some(ux) = uxtheme_dark() {
+            // SAFETY: 值参数调用；策略为线程级，菜单关闭后恢复 Default。
+            (ux.set_preferred_app_mode)(APP_MODE_ALLOW_DARK);
+            (ux.refresh_immersive_color_policy_state)();
+        }
+    }
+    let hook = if dark {
+        // SAFETY: 钩子过程为静态函数；WH_CBT 线程钩子（idThread=当前线程）不跨进程。
+        SetWindowsHookExW(WH_CBT, Some(menu_cbt_hook), None, GetCurrentThreadId()).ok()
+    } else {
+        None
+    };
     let cmd = TrackPopupMenu(
         menu,
         TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD,
@@ -293,6 +445,15 @@ unsafe fn show_menu(hwnd: HWND) {
         hwnd,
         None,
     );
+    if let Some(h) = hook {
+        let _ = UnhookWindowsHookEx(h);
+    }
+    if dark {
+        if let Some(ux) = uxtheme_dark() {
+            // SAFETY: 值参数调用；恢复默认策略，避免影响其它 uxtheme 消费者。
+            (ux.set_preferred_app_mode)(APP_MODE_DEFAULT);
+        }
+    }
     let _ = DestroyMenu(menu);
     if cmd.0 != 0 {
         if let Ok(cb) = callback_slot().lock() {
