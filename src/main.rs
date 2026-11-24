@@ -835,6 +835,17 @@ fn run_ui_smoke(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value
             panel.set_t_title(tt_localize::t("PANEL_TITLE").into());
             let theme = panel.global::<twinkle_tray_rust::Theme>();
             println!("theme dark={} win11={}", theme.get_dark(), theme.get_win11());
+            // 内置 Palette 同步自检（std-widgets 深浅色来源，应与 theme.dark 一致）
+            {
+                use slint::private_unstable_api::re_exports::ColorScheme;
+                let scheme = panel.global::<twinkle_tray_rust::Palette>().get_color_scheme();
+                println!(
+                    "palette color-scheme={:?} (expect {})",
+                    scheme,
+                    if theme.get_dark() { "Dark" } else { "Light" }
+                );
+                let _ = ColorScheme::Unknown; // 类型自检：枚举可访问
+            }
             println!("panel title: {}", panel.get_t_title());
         }
         Err(e) => println!("panel window FAILED: {}", e),

@@ -754,3 +754,56 @@ WMIC / WMI-Bridge / Win32-DisplayConfig）只有右侧圆钮，左侧标题整�
   编译失败并直接指向该模块（不会静默退化）。
 - 拖动时窗口被拖出屏幕外（例如整个窗口移到屏幕左侧之外）后再拖动标题栏，鼠标可点区域变窄，
   属于 Windows 正常语义，未做特殊处理。
+
+## Round 19 · 2026-11-24：修复「设置下拉框样式只跟随系统深浅色」
+
+### 症状
+
+设置窗口里 std-widgets 下拉框（ComboBox，以及 LineEdit/ScrollView 等一切 fluent 标准控件）
+的深浅色**只跟随 Windows 系统设置**：系统深色 + 应用选浅色主题时，自绘部分是浅色、
+下拉框却是深色，两套配色脱节。Round 12 引入 ComboBox 后暴露。
+
+### 根因
+
+两套配色来源不同步：
+
+| 配色域 | 来源 | 受控方 |
+|---|---|---|
+| 自绘控件（滑条/行/按钮等） | 自定义 `Theme` 全局（ui/theme.slint） | `apply_theme`/`apply_settings_theme` 按 settings.theme 设 `dark` |
+| std-widgets（fluent 样式） | Slint 内置 `Palette` 全局的 `color-scheme` | **从未设置** → 保持 `Unknown` → 跟随系统 |
+
+### 修复
+
+1. **`ui/all.slint`**：`import { Palette } from "std-widgets.slint"; export { Palette }`
+   （fluent 的 std-widgets.slint 导出该全局；不 re-export 则生成的 Rust API 不含它，
+   实测 `export { Palette }` 裸写报 `'Palette' not found`）。
+2. **`src/window_state.rs`**：新增 `palette_set_dark(&Palette, dark)` —— 按解析出的深浅色
+   调 `Palette.set_color_scheme(Dark/Light)`（类型来自
+   `slint::private_unstable_api::re_exports::ColorScheme`）。三个主题应用点
+   （`apply_theme` 面板 / `apply_settings_theme` 设置窗口 / `apply_theme_generic` intro）全部接线。
+   四窗口同属 all.slint 编译单元 → Palette 全局实例共享，设一次全生效；
+   ComboBox 弹出层与宿主组件共享 globals，下拉列表同样跟随。
+3. **`src/main.rs` ui-smoke**：新增 `palette color-scheme=... (expect ...)` 自检输出，
+   断言方向为「与 Theme.dark 一致」。
+
+### 真机对拍（2026-11-24 · Win11 系统深色）
+
+```
+# 系统深色 + 用户真实 settings（跟随系统）→ dark=true / palette Dark   ✅
+.\target\debug\twinkle-tray-rust.exe --ui-smoke --console
+
+# 系统深色 + --portable 临时 settings.json 强制 theme=light
+#   → theme dark=false / palette color-scheme=Light (expect Light)      ✅
+#   （修复前 palette 恒 Unknown，std-widgets 跟系统呈深色 —— 即本缺陷）
+.\target\debug\twinkle-tray-rust.exe --ui-smoke --console --portable
+```
+
+cargo test --workspace 全绿（0 失败）；cargo build 零错误
+（仅既有的 `target_os = "win32"` 死分支 warning，与本次无关）。
+
+### 踩坑记录
+
+- 内置全局 `Palette` 不是编译器裸作用域符号，必须从 `std-widgets.slint` import 后 re-export
+  才会出现在 include_modules 的 Rust API 里。
+- Rust 侧 `ColorScheme` 枚举未在 slint 顶层公开，位于
+  `slint::private_unstable_api::re_exports::ColorScheme`（Unknown/Dark/Light）。

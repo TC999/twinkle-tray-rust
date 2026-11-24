@@ -5,5 +5,12 @@ import { SettingsWindow } from "settings.slint";
 import { IntroWindow } from "intro.slint";
 import { HudWindow } from "hud.slint";
 import { Theme } from "theme.slint";
+// 内置 Palette 全局（fluent std-widgets 的配色来源，color-scheme 属性可写）。
+// re-export 给 Rust 侧：应用主题（theme=dark/light/default）必须同步到该全局，
+// 否则 ComboBox/LineEdit 等 std-widgets 的深浅色只跟随系统设置，与应用主题脱节。
+// 四窗口同属本编译单元，Palette 全局实例共享，任一窗口设置即全部生效。
+import { Palette } from "std-widgets.slint";
 
 export { PanelWindow, SettingsWindow, IntroWindow, HudWindow, Theme }
+
+export { Palette }

@@ -4,8 +4,17 @@
 //! + origin/src/css/vars.scss 的主题变量 + panel.js 的 updateMica 定位。
 
 use serde_json::Value;
-use crate::Theme;
+use crate::{Palette, Theme};
 use slint::ComponentHandle;
+
+/// 把解析出的深浅色同步到 Slint 内置 Palette 全局（fluent std-widgets 的配色来源）。
+/// 不做这一步时，ComboBox/LineEdit/ScrollView/ToggleBox 等 std-widgets 的深浅色
+/// 只跟随 Windows 系统设置，与应用内主题（theme=dark/light/default）脱节。
+/// 四窗口同属 all.slint 编译单元 → Palette 全局实例共享，任一窗口设置即全部生效。
+pub fn palette_set_dark(palette: &Palette, dark: bool) {
+    use slint::private_unstable_api::re_exports::ColorScheme;
+    palette.set_color_scheme(if dark { ColorScheme::Dark } else { ColorScheme::Light });
+}
 
 /// 把 settings 应用到 Theme 全局（equiv body[data-theme] / [data-is-win11]）。
 pub fn apply_theme(panel: &crate::PanelWindow, settings: &Value) {
@@ -26,6 +35,7 @@ pub fn apply_theme(panel: &crate::PanelWindow, settings: &Value) {
     let theme = panel.global::<Theme>();
     theme.set_dark(dark);
     theme.set_win11(win11);
+    palette_set_dark(&panel.global::<Palette>(), dark);
     if let Some(accent) = settings.get("accentColor").and_then(|v| v.as_str()) {
         if let Some(color) = parse_color(accent) {
             theme.set_accent(color);
@@ -59,6 +69,7 @@ pub fn resolve_theme(settings: &Value) -> (bool, bool, Option<slint::Color>) {
 pub fn apply_theme_generic(intro: &crate::IntroWindow, settings: &Value) {
     let (dark, _, _) = resolve_theme(settings);
     intro.set_dark(dark);
+    palette_set_dark(&intro.global::<Palette>(), dark);
 }
 
 /// 把 settings 应用到设置窗口的 Theme（equiv body[data-theme]）。
@@ -79,6 +90,7 @@ pub fn apply_settings_theme(ui: &crate::SettingsWindow, settings: &Value) {
     let theme = ui.global::<Theme>();
     theme.set_dark(dark);
     theme.set_win11(win11);
+    palette_set_dark(&ui.global::<Palette>(), dark);
     if let Some(accent) = settings.get("accentColor").and_then(|v| v.as_str()) {
         if let Some(color) = parse_color(accent) {
             theme.set_accent(color);
