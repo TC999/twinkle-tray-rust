@@ -705,3 +705,54 @@ WMIC / WMI-Bridge / Win32-DisplayConfig）只有右侧圆钮，左侧标题整�
 `hotkeys_post_items_match_origin_sections`、`monitors_page_has_no_sleep_action`、
 `hotkey_add_and_remove`（补快照断言）。`cargo test --workspace` 152 passed / 0 failed；
 `cargo build --workspace` 零错误。
+
+## Round 15 · 2026-11-24：修复「光照传感器 / 更新」页缺字 + 点路径键写入错位
+
+### 症状
+
+光感页与更新页大量标题/说明渲染为空串；光感页开关/下拉/输入框读不到当前值，
+改动会写到顶层 `enabled` 等键而非 `lightSensor.*`。
+
+### 根因
+
+1. **失效 i18n 键**（与 Round 13/14 同类）：`SETTINGS_LIGHT_SENSOR_ENABLE_TITLE`、
+   `*_SELECT_TITLE`、`*_INTERVAL_TITLE`、`SETTINGS_UPDATES_BRANCH_TITLE`、
+   `SETTINGS_UPDATES_CHECK_TITLE`、`SETTINGS_UPDATES_CHECK_BUTTON`、
+   `SETTINGS_ADVANCED_OPEN_SETTINGS_FILE` 均不存在于语料（t() 经 en 回退仍为空串）。
+   语料中真实键为 `SETTINGS_LIGHT_SENSOR_ENABLE/_TYPE_*/_POLLING_*`、
+   `SETTINGS_UPDATES_CHANNEL/_BRANCH_STABLE/_BRANCH_BETA`、`SETTINGS_DEBUG_OPEN_SETTINGS`。
+2. **选项标签硬编码英文**：光感类型与更新频道选项未走语料（原版为
+   `SETTINGS_LIGHT_SENSOR_TYPE_YOCTO/_FAKE/_WINDOWS`、`SETTINGS_UPDATES_BRANCH_STABLE/_BETA`）。
+3. **子对象键位错位**：光感页把 `&lightSensor` 子对象传给条目构建、键用裸 `enabled`，
+   读值错位；且 `update_setting` 只支持顶层键，改动落到顶层 `enabled`。
+4. **新增键**：`SETTINGS_UPDATES_CHECK_TITLE/_CHECK_BUTTON`（原版更新页无手动检查
+   按钮，Rust 版补的功能）补入 en.ftl + zh-Hans.ftl（其余语言走 en 回退）。
+
+### 修复
+
+- `src/settings_view.rs`：新增 `get_in()`（点路径取值），toggle/select/number 全部
+  改走 get_in；光感页条目键改为 `lightSensor.enabled/active/sensorPollingInterval`，
+  全部键名与选项标签对齐语料（顺序 yocto/fake/windows 照抄原版）；更新页改
+  `SETTINGS_UPDATES_TITLE/_CHANNEL/_BRANCH_*`，open-settings-file 按钮改
+  `GENERIC_SETTINGS` + `SETTINGS_DEBUG_OPEN_SETTINGS`。
+- `src/settings_host.rs`：`update_setting` 支持点路径键（逐层确保子对象存在后写入）。
+- `crates/tt-localize`：zh_hans_available 计数 253 → 255。
+
+### 验证
+
+- 真机 `--ui-demo=light-sensor` 全屏截图：标题 + 说明 + Enable feature 开关(ON，
+  与 settings 一致) + Sensor type 下拉(Windows Ambient) + 轮询间隔输入框(5) 全部渲染；
+  `--ui-demo=updates`（手动切页）全屏截图：更新标题 + 自动检查开关 + 更新频道下拉
+  (稳定版（默认）) + 检查更新按钮 + Open Settings 按钮全部渲染（zh-Hans 语料命中）。
+- 经验教训：**no-frame 窗口 + 系统 DPI 缩放会使 GetWindowRect 与截图坐标错位**，
+  此前按 rect 裁剪的截图把右侧控件全部裁掉，造成「控件缺失」的误判；
+  验证 UI 一律用全屏截图目视定位窗口，不做坐标裁剪。
+- 新增 3 用例：`light_sensor_page_items_match_origin_keys`、
+  `updates_page_items_match_origin_keys`、`update_setting_dotted_key_writes_nested_object`。
+  `cargo test --workspace` 155 passed / 0 failed。
+
+### 遗留
+
+- 光感页「Monitor settings」逐显示器 Lux 映射区（原版 LightSensorSettings.jsx 后半段）、
+  传感器状态卡片（Fake/Windows/Yocto 详情）未实现。
+- 检查更新按钮仅在页面内触发，无后台版本提示（原版 PANEL_UPDATE_AVAILABLE 面板提示）。

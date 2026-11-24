@@ -509,7 +509,27 @@ fn update_setting(settings: &Arc<Mutex<Value>>, key: &str, value: Value) -> Valu
         Ok(g) => g,
         Err(_) => return json!({}),
     };
-    if let Some(obj) = guard.as_object_mut() {
+    // 点路径键（如 lightSensor.enabled）写入嵌套子对象；无点时等同顶层插入。
+    if key.contains('.') {
+        let parts: Vec<&str> = key.split('.').collect();
+        let mut node = guard.as_object_mut();
+        for (i, part) in parts.iter().enumerate() {
+            let is_last = i == parts.len() - 1;
+            match node {
+                Some(obj) => {
+                    if is_last {
+                        obj.insert(part.to_string(), value.clone());
+                        break;
+                    }
+                    if !obj.get(*part).map(|v| v.is_object()).unwrap_or(false) {
+                        obj.insert(part.to_string(), json!({}));
+                    }
+                    node = obj.get_mut(*part).and_then(|v| v.as_object_mut());
+                }
+                None => break,
+            }
+        }
+    } else if let Some(obj) = guard.as_object_mut() {
         obj.insert(key.to_string(), value);
     }
     let updated = guard.clone();
@@ -1136,6 +1156,28 @@ mod tests {
         let updated = update_setting(&settings, "theme", json!("dark"));
         assert_eq!(updated["theme"], json!("dark"));
         assert_eq!(settings.lock().unwrap()["theme"], json!("dark"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::env::remove_var("TT_SETTINGS_PATH");
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_setting_dotted_key_writes_nested_object() {
+        // 光感页条目键是点路径（lightSensor.enabled）：写入必须落在
+        // settings.lightSensor.enabled，而非顶层 enabled（此前键位错位）。
+        let dir = std::env::temp_dir().join("tt-settings-dotted-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("settings.json");
+        std::env::set_var("TT_SETTINGS_PATH", &file);
+        let settings = Arc::new(Mutex::new(json!({
+            "lightSensor": {"enabled": false, "active": "fake"}
+        })));
+        let updated = update_setting(&settings, "lightSensor.enabled", json!(true));
+        assert_eq!(updated["lightSensor"]["enabled"], json!(true));
+        assert_eq!(updated["lightSensor"]["active"], json!("fake"));
+        assert!(updated.get("enabled").is_none());
+        assert_eq!(settings.lock().unwrap()["lightSensor"]["enabled"], json!(true));
         std::thread::sleep(std::time::Duration::from_millis(500));
         std::env::remove_var("TT_SETTINGS_PATH");
         std::fs::remove_file(&file).ok();

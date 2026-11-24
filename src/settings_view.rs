@@ -71,8 +71,7 @@ impl ItemBuilder {
             } else {
                 tt_localize::t(desc_key).into()
             },
-            toggle_value: settings
-                .get(key)
+            toggle_value: get_in(settings, key)
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             ..Default::default()
@@ -111,8 +110,7 @@ impl ItemBuilder {
         settings: &Value,
         options: &[(&str, String)],
     ) -> &mut Self {
-        let current = settings
-            .get(key)
+        let current = get_in(settings, key)
             .map(json_to_string)
             .unwrap_or_default();
         let values: Vec<&str> = options.iter().map(|(v, _)| *v).collect();
@@ -153,8 +151,7 @@ impl ItemBuilder {
             } else {
                 tt_localize::t(desc_key).into()
             },
-            text_value: settings
-                .get(key)
+            text_value: get_in(settings, key)
                 .map(json_to_string)
                 .unwrap_or_default()
                 .into(),
@@ -204,6 +201,19 @@ fn json_to_string(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         other => other.to_string(),
     }
+}
+
+/// 按键取值：支持点路径（`lightSensor.enabled`），无点时等同 `Value::get`。
+/// 子对象页（光感页）的条目键需要穿透一层子对象才能读到当前值。
+fn get_in<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    if !key.contains('.') {
+        return value.get(key);
+    }
+    let mut cur = value;
+    for part in key.split('.') {
+        cur = cur.get(part)?;
+    }
+    Some(cur)
 }
 
 /// 下拉选中下标：当前值在选项值中的位置；未知值回落第一项（equiv <select>
@@ -669,32 +679,39 @@ fn has_native_brightness_hotkey(s: &Value) -> bool {
 }
 
 /// 光感页（equiv LightSensorSettings.jsx）。
+///
+/// 条目键使用点路径（`lightSensor.enabled` 等）：光感设置是 settings.lightSensor
+/// 的子对象，此前把 `&ls` 子对象传给条目构建、键仍是裸 `enabled`，导致
+/// 「读不到当前值 + 改动写到顶层 enabled 而非 lightSensor.enabled」双重错位。
 fn light_sensor_page(b: &mut ItemBuilder, s: &Value) {
-    let ls = s.get("lightSensor").cloned().unwrap_or(json!({}));
-    b.section(&tt_localize::t("SETTINGS_SIDEBAR_LIGHT_SENSOR"));
-    b.toggle("enabled", "SETTINGS_LIGHT_SENSOR_ENABLE_TITLE", "SETTINGS_LIGHT_SENSOR_ENABLE_DESC", &ls);
+    b.section(&tt_localize::t("SETTINGS_LIGHT_SENSOR_TITLE"));
+    b.note(&tt_localize::t("SETTINGS_LIGHT_SENSOR_DESC"));
+    b.toggle("lightSensor.enabled", "SETTINGS_LIGHT_SENSOR_ENABLE", "", s);
     b.select(
-        "active",
-        "SETTINGS_LIGHT_SENSOR_SELECT_TITLE",
-        "SETTINGS_LIGHT_SENSOR_SELECT_DESC",
-        &ls,
+        "lightSensor.active",
+        "SETTINGS_LIGHT_SENSOR_TYPE_TITLE",
+        "SETTINGS_LIGHT_SENSOR_TYPE_DESC",
+        s,
         &[
-            ("fake", "Fake".to_string()),
-            ("windows", "Windows".to_string()),
-            ("yocto", "Yocto".to_string()),
+            ("yocto", tt_localize::t("SETTINGS_LIGHT_SENSOR_TYPE_YOCTO")),
+            ("fake", tt_localize::t("SETTINGS_LIGHT_SENSOR_TYPE_FAKE")),
+            (
+                "windows",
+                tt_localize::t("SETTINGS_LIGHT_SENSOR_TYPE_WINDOWS"),
+            ),
         ],
     );
     b.number(
-        "sensorPollingInterval",
-        "SETTINGS_LIGHT_SENSOR_INTERVAL_TITLE",
-        "SETTINGS_LIGHT_SENSOR_INTERVAL_DESC",
-        &ls,
+        "lightSensor.sensorPollingInterval",
+        "SETTINGS_LIGHT_SENSOR_POLLING_TITLE",
+        "SETTINGS_LIGHT_SENSOR_POLLING_DESC",
+        s,
     );
 }
 
 /// 更新页（equiv L1700-L1760）。
 fn updates_page(b: &mut ItemBuilder, s: &Value) {
-    b.section(&tt_localize::t("SETTINGS_SIDEBAR_UPDATES"));
+    b.section(&tt_localize::t("SETTINGS_UPDATES_TITLE"));
     b.toggle(
         "checkForUpdates",
         "SETTINGS_UPDATES_AUTOMATIC_TITLE",
@@ -703,12 +720,15 @@ fn updates_page(b: &mut ItemBuilder, s: &Value) {
     );
     b.select(
         "branch",
-        "SETTINGS_UPDATES_BRANCH_TITLE",
+        "SETTINGS_UPDATES_CHANNEL",
         "",
         s,
         &[
-            ("master", "Release".to_string()),
-            ("beta", "Beta".to_string()),
+            (
+                "master",
+                tt_localize::t("SETTINGS_UPDATES_BRANCH_STABLE"),
+            ),
+            ("beta", tt_localize::t("SETTINGS_UPDATES_BRANCH_BETA")),
         ],
     );
     b.button(
@@ -719,9 +739,9 @@ fn updates_page(b: &mut ItemBuilder, s: &Value) {
     );
     b.button(
         "open-settings-file",
-        "SETTINGS_ADVANCED_OPEN_SETTINGS_FILE",
+        "GENERIC_SETTINGS",
         "",
-        "SETTINGS_ADVANCED_OPEN_SETTINGS_FILE",
+        "SETTINGS_DEBUG_OPEN_SETTINGS",
     );
 }
 
@@ -964,7 +984,7 @@ pub fn model<T: Clone + 'static>(items: Vec<T>) -> ModelRc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slint::Model;
+    use slint::{Model, SharedString};
 
     #[test]
     fn pages_match_origin_sidebar() {
@@ -1201,5 +1221,78 @@ mod tests {
         // 原版 sleepAction 只在热键页 TOD 区，不在显示器页
         let items = build_items("monitors", &json!({}));
         assert!(items.iter().all(|i| i.key != "sleepAction"));
+    }
+
+    #[test]
+    fn light_sensor_page_items_match_origin_keys() {
+        // equiv LightSensorSettings.jsx：标题/说明/Enable/类型/轮询间隔，
+        // 全部使用语料中真实存在的键（此前 *_ENABLE_TITLE 等键不存在渲染为空）。
+        let s = json!({"lightSensor": {"enabled": true, "active": "windows", "sensorPollingInterval": 5}});
+        let items = build_items("light-sensor", &s);
+        assert_eq!(
+            items.iter().find(|i| i.kind == SettingsItemKind::Section).unwrap().title,
+            tt_localize::t("SETTINGS_LIGHT_SENSOR_TITLE")
+        );
+        assert!(items.iter().any(|i| i.kind == SettingsItemKind::Note
+            && i.title == tt_localize::t("SETTINGS_LIGHT_SENSOR_DESC")));
+        let toggle = items
+            .iter()
+            .find(|i| i.key == "lightSensor.enabled")
+            .unwrap();
+        assert_eq!(toggle.title, tt_localize::t("SETTINGS_LIGHT_SENSOR_ENABLE"));
+        assert!(toggle.toggle_value);
+        let sel = items.iter().find(|i| i.key == "lightSensor.active").unwrap();
+        assert_eq!(sel.title, tt_localize::t("SETTINGS_LIGHT_SENSOR_TYPE_TITLE"));
+        // 选项标签来自语料（原版顺序 yocto/fake/windows，Windows Ambient 全名）
+        assert_eq!(
+            model_labels(&sel.option_labels),
+            vec![
+                tt_localize::t("SETTINGS_LIGHT_SENSOR_TYPE_YOCTO"),
+                tt_localize::t("SETTINGS_LIGHT_SENSOR_TYPE_FAKE"),
+                tt_localize::t("SETTINGS_LIGHT_SENSOR_TYPE_WINDOWS"),
+            ]
+        );
+        // 当前值从嵌套子对象读取（此前读 &ls 子对象键位错位恒为默认）
+        assert_eq!(sel.selected_index, 2);
+        let num = items
+            .iter()
+            .find(|i| i.key == "lightSensor.sensorPollingInterval")
+            .unwrap();
+        assert_eq!(num.title, tt_localize::t("SETTINGS_LIGHT_SENSOR_POLLING_TITLE"));
+        assert_eq!(num.text_value, "5");
+    }
+
+    #[test]
+    fn updates_page_items_match_origin_keys() {
+        // equiv L1700-L1760：频道下拉 + 稳定/测试版选项来自语料，
+        // 检查更新按钮标题/按钮文字均非空。
+        let s = json!({"checkForUpdates": true, "branch": "master"});
+        let items = build_items("updates", &s);
+        assert_eq!(
+            items.iter().find(|i| i.kind == SettingsItemKind::Section).unwrap().title,
+            tt_localize::t("SETTINGS_UPDATES_TITLE")
+        );
+        let sel = items.iter().find(|i| i.key == "branch").unwrap();
+        assert_eq!(sel.title, tt_localize::t("SETTINGS_UPDATES_CHANNEL"));
+        assert_eq!(
+            model_labels(&sel.option_labels),
+            vec![
+                tt_localize::t("SETTINGS_UPDATES_BRANCH_STABLE"),
+                tt_localize::t("SETTINGS_UPDATES_BRANCH_BETA"),
+            ]
+        );
+        for item in &items {
+            assert!(!item.title.is_empty(), "empty title on {:?}", item.key);
+        }
+        let check = items.iter().find(|i| i.key == "check-for-updates").unwrap();
+        assert!(!check.title.is_empty() && !check.button_label.is_empty());
+    }
+
+    /// 把 ModelRc<SharedString> 收集成 Vec<String> 便于断言。
+    fn model_labels(model: &ModelRc<SharedString>) -> Vec<String> {
+        (0..model.row_count())
+            .filter_map(|i| model.row_data(i))
+            .map(|s: SharedString| s.to_string())
+            .collect()
     }
 }

@@ -186,7 +186,7 @@ mod tests {
     fn zh_hans_available() {
         let zh = parse_ftl(include_str!("../../../src/localization/zh-Hans.ftl"));
         assert_eq!(zh.get("GENERIC_OK"), Some(&"确定"));
-        assert_eq!(zh.len(), 253);
+        assert_eq!(zh.len(), 255);
     }
 
     #[test]
