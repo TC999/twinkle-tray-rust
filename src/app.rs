@@ -82,6 +82,8 @@ pub struct LaunchOptions {
     pub ui_smoke: bool,
     /// --ui-demo（真机渲染：显示面板 + 设置窗口供截图对拍）
     pub ui_demo: bool,
+    /// --ui-demo=<page>（ui-demo 的设置窗口初始页，如 hotkeys/monitors/general）
+    pub ui_demo_page: Option<String>,
     /// --brightness-smoke=<level>（亮度闭环对拍）
     pub brightness_smoke: Option<f64>,
     /// --udp-smoke（UDP 服务器真机对拍）
@@ -103,7 +105,13 @@ impl LaunchOptions {
             is_monitor_worker: args.iter().any(|a| a == "--monitor-worker"),
             app_smoke: args.iter().any(|a| a == "--app-smoke"),
             ui_smoke: args.iter().any(|a| a == "--ui-smoke"),
-            ui_demo: args.iter().any(|a| a == "--ui-demo"),
+            ui_demo: args
+                .iter()
+                .any(|a| a == "--ui-demo" || a.starts_with("--ui-demo=")),
+            ui_demo_page: args
+                .iter()
+                .find_map(|a| a.strip_prefix("--ui-demo="))
+                .map(|v| v.to_string()),
             brightness_smoke: args
                 .iter()
                 .find_map(|a| a.strip_prefix("--brightness-smoke="))

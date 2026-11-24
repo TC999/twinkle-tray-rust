@@ -60,6 +60,10 @@ pub fn open_settings_window(
         "general",
         &snapshot,
     )));
+    ui.set_items_after(settings_view::model(settings_view::build_post_items(
+        "general",
+        &snapshot,
+    )));
 
     // 显示器列表：打开即注入主进程缓存（equiv SettingsWindow componentDidMount 时
     // this.state.monitors 已由主进程填充）。此前漏注入 → monitors 模型恒为空
@@ -98,6 +102,10 @@ pub fn refresh_settings_view(handle: &SettingsWindowHandle, settings: &Value, mo
     ui.set_hotkeys(settings_view::model(settings_view::build_hotkeys(settings)));
     let page = ui.get_active_page().to_string();
     ui.set_items(settings_view::model(settings_view::build_items(
+        page.as_str(),
+        settings,
+    )));
+    ui.set_items_after(settings_view::model(settings_view::build_post_items(
         page.as_str(),
         settings,
     )));
@@ -190,6 +198,9 @@ fn wire_callbacks(
         ui.set_items(settings_view::model(settings_view::build_items(
             &page, &current,
         )));
+        ui.set_items_after(settings_view::model(settings_view::build_post_items(
+            &page, &current,
+        )));
     });
 
     // 开关 -> settings 写回 + 下发 worker（equiv sendSettings -> writeSettings -> processSettings）
@@ -203,6 +214,9 @@ fn wire_callbacks(
         apply_side_effects(&worker, &key, &updated);
         let page = ui.get_active_page().to_string();
         ui.set_items(settings_view::model(settings_view::build_items(
+            &page, &updated,
+        )));
+        ui.set_items_after(settings_view::model(settings_view::build_post_items(
             &page, &updated,
         )));
     });
@@ -260,6 +274,9 @@ fn wire_callbacks(
         }
         let page = ui.get_active_page().to_string();
         ui.set_items(settings_view::model(settings_view::build_items(
+            &page, &updated,
+        )));
+        ui.set_items_after(settings_view::model(settings_view::build_post_items(
             &page, &updated,
         )));
     });
@@ -383,14 +400,31 @@ fn wire_callbacks(
         }
     });
 
-    // 热键（equiv addHotkey / deleteHotkey）
+    // 热键（equiv addHotkey / deleteHotkey 的 window.sendSettings({hotkeys}) 全链）：
+    // 写回 settings → 落盘调度 → 下发 worker → 重新注册热键（equiv processSettings
+    // L1272-L1274 的 newSettings.hotkeys !== undefined -> applyHotkeys）→ 刷新 UI 列表
+    // （equiv applyHotkeys 末尾 sendToAllWindows('settings-updated')）。
     let snap = settings.clone();
+    let worker = host.clone();
+    let weak = ui.as_weak();
     ui.on_hotkey_add(move || {
-        add_hotkey(&snap);
+        if let Some(updated) = add_hotkey(&snap) {
+            apply_side_effects(&worker, "hotkeys", &updated);
+            schedule_write_settings(&snap);
+            crate::panel_controller::reapply_hotkeys(&updated);
+            refresh_hotkey_models(&weak, &updated);
+        }
     });
     let snap = settings.clone();
+    let worker = host.clone();
+    let weak = ui.as_weak();
     ui.on_hotkey_remove(move |id| {
-        remove_hotkey(&snap, &id);
+        if let Some(updated) = remove_hotkey(&snap, &id) {
+            apply_side_effects(&worker, "hotkeys", &updated);
+            schedule_write_settings(&snap);
+            crate::panel_controller::reapply_hotkeys(&updated);
+            refresh_hotkey_models(&weak, &updated);
+        }
     });
     ui.on_hotkey_record(move |_id| {
         // 录制由低级键盘钩子驱动（RegisterHotKey 只做注册，录制需 WH_KEYBOARD_LL）
@@ -747,10 +781,11 @@ fn move_monitor(settings: &Arc<Mutex<Value>>, key: &str, delta: i32) {
 }
 
 /// 新增热键（equiv addHotkey：accelerator 空，一条 offset 动作）。
-fn add_hotkey(settings: &Arc<Mutex<Value>>) {
+/// 返回变更后的 settings 快照（供下发 worker / 重注册热键 / 刷新 UI）。
+fn add_hotkey(settings: &Arc<Mutex<Value>>) -> Option<Value> {
     let mut guard = match settings.lock() {
         Ok(g) => g,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let mut list = guard
         .get("hotkeys")
@@ -771,13 +806,14 @@ fn add_hotkey(settings: &Arc<Mutex<Value>>) {
         }]
     }));
     guard["hotkeys"] = json!(list);
+    Some(guard.clone())
 }
 
-/// 删除热键（equiv deleteHotkey）。
-fn remove_hotkey(settings: &Arc<Mutex<Value>>, id: &str) {
+/// 删除热键（equiv deleteHotkey）。返回变更后的 settings 快照。
+fn remove_hotkey(settings: &Arc<Mutex<Value>>, id: &str) -> Option<Value> {
     let mut guard = match settings.lock() {
         Ok(g) => g,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let list: Vec<Value> = guard
         .get("hotkeys")
@@ -790,6 +826,23 @@ fn remove_hotkey(settings: &Arc<Mutex<Value>>, id: &str) {
         })
         .unwrap_or_default();
     guard["hotkeys"] = json!(list);
+    Some(guard.clone())
+}
+
+/// 热键增删后的 UI 刷新（equiv sendToAllWindows('settings-updated') 的
+/// 设置窗口子集：热键列表 + 当前页设置项——原生亮度警告随列表条件变化）。
+fn refresh_hotkey_models(weak: &slint::Weak<crate::SettingsWindow>, settings: &Value) {
+    let Some(ui) = weak.upgrade() else { return };
+    ui.set_hotkeys(settings_view::model(settings_view::build_hotkeys(settings)));
+    let page = ui.get_active_page().to_string();
+    ui.set_items(settings_view::model(settings_view::build_items(
+        page.as_str(),
+        settings,
+    )));
+    ui.set_items_after(settings_view::model(settings_view::build_post_items(
+        page.as_str(),
+        settings,
+    )));
 }
 
 /// 按钮动作分发（equiv ipcMain.on 表 L3645-L3733）。
@@ -887,7 +940,6 @@ fn apply_texts(ui: &crate::SettingsWindow) {
     ui.set_t_hotkeys_add(tt_localize::t("SETTINGS_HOTKEYS_ADD").into());
     ui.set_t_hotkeys_remove(tt_localize::t("GENERIC_DELETE").into());
     ui.set_t_hotkeys_record(tt_localize::t("SETTINGS_HOTKEYS_PRESS_KEYS_HINT").into());
-    ui.set_t_no_hotkeys(tt_localize::t("SETTINGS_HOTKEYS_NONE").into());
     // monitors 页：All Displays 标题与空态提示（equiv getInfoMonitors 的两条分支）
     ui.set_t_all_displays(tt_localize::t("GENERIC_ALL_DISPLAYS").into());
     ui.set_t_no_displays(tt_localize::t("GENERIC_NO_COMPATIBLE_DISPLAYS").into());
@@ -946,14 +998,16 @@ mod tests {
     #[test]
     fn hotkey_add_and_remove() {
         let settings = Arc::new(Mutex::new(json!({"hotkeys": [], "hotkeyPercent": 15})));
-        add_hotkey(&settings);
+        let snapshot = add_hotkey(&settings).expect("add_hotkey returns snapshot");
+        assert_eq!(snapshot["hotkeys"].as_array().unwrap().len(), 1);
         let list = settings.lock().unwrap()["hotkeys"].as_array().unwrap().len();
         assert_eq!(list, 1);
         let id = settings.lock().unwrap()["hotkeys"][0]["id"]
             .as_str()
             .unwrap()
             .to_string();
-        remove_hotkey(&settings, &id);
+        let snapshot = remove_hotkey(&settings, &id).expect("remove_hotkey returns snapshot");
+        assert_eq!(snapshot["hotkeys"].as_array().unwrap().len(), 0);
         assert_eq!(
             settings.lock().unwrap()["hotkeys"].as_array().unwrap().len(),
             0

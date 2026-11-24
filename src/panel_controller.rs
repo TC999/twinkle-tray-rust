@@ -360,6 +360,7 @@ thread_local! {
     /// SystemEvents 主线程槽位(由 run_panel_controller_with_runtime 安装)。
     static SYSTEM_EVENTS_SLOT: std::cell::RefCell<Option<crate::system_events::SystemEvents>> =
         const { std::cell::RefCell::new(None) };
+
     /// 面板窗口槽位（主线程独占，存 Weak：强引用仍由 run 函数持有）。
     /// 设置窗口改主题/语言时联动刷新面板
     /// （equiv sendToAllWindows('theme-settings', ...) / getLocalization 的全窗口广播）。
@@ -372,6 +373,19 @@ pub fn apply_panel_theme(settings: &Value) {
     PANEL_WINDOW.with(|slot| {
         if let Some(panel) = slot.borrow().as_ref().and_then(|w| w.upgrade()) {
             window_state::apply_theme(&panel, settings);
+        }
+    });
+}
+
+/// 重新注册全局热键（equiv processSettings L1272-L1274：
+/// newSettings.hotkeys !== undefined -> applyHotkeys）。
+/// 设置窗口与面板同处主线程事件循环，故经 SYSTEM_EVENTS_SLOT 触达；
+/// 纯预览模式（无面板）下槽位为空，静默跳过。
+pub fn reapply_hotkeys(settings: &Value) {
+    SYSTEM_EVENTS_SLOT.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        if let Some(system) = borrow.as_mut() {
+            system.apply_hotkeys_now(settings);
         }
     });
 }

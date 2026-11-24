@@ -643,3 +643,65 @@ WMIC / WMI-Bridge / Win32-DisplayConfig）只有右侧圆钮，左侧标题整�
 新增 `troubleshooting_toggles_keep_literal_titles`：断言 6 项标题逐字匹配原版、
 且 general 页不存在空标题项。`cargo test --lib` 55 passed / 0 failed；
 `cargo build` 零错误。
+
+## Round 14 · 2026-11-24：修复「快捷键」设置页全空 + 热键增删全链
+
+### 症状
+
+设置 → Hotkeys & Shortcuts 页几乎全空：无标题/说明/开关，只有（空字符串的）占位文本
+和一个 "+ Add Hotkey" 小按钮；且点击 "+ Add Hotkey" 无任何反应，页面永远空白。
+
+### 根因（三层）
+
+1. **items 构建了但从未渲染**：`hotkeys_page()` 构建的标题/说明/break/scroll 等项
+   挂在 `root.items` 上，而 `settings.slint` 内容区 `SettingsItems` 分支的条件
+   （`active-page != "monitors" && != "hotkeys"`）把 hotkeys 页排除，
+   hotkeys 分支只渲染热键列表本体 → items 全部丢失。
+2. **失效的 i18n 键**：`SETTINGS_HOTKEYS_NONE`（语料中不存在，占位文本恒空）、
+   `SETTINGS_HOTKEYS_SCROLL_AMOUNT_TITLE`（正确键为 `SETTINGS_HOTKEYS_SCROLL_AMOUNT`）、
+   `SETTINGS_HOTKEYS_PERCENT_TITLE`（不存在，且原版页面本无 hotkeyPercent 行）。
+3. **"+ Add Hotkey" 断链**：`add_hotkey`/`remove_hotkey` 只改内存 settings，
+   既不刷新 UI 模型，也不落盘/下发 worker/重注册热键（原版
+   `window.sendSettings({hotkeys})` → processSettings → applyHotkeys 全链）。
+
+### 修复
+
+- `ui/settings.slint`：新增 `items-after` 属性；hotkeys 分支改为
+  「列表前 items（标题/说明/原生亮度警告）→ 热键列表 + "+ Add Hotkey" →
+  列表后 items（break/scroll/TOD）」，删除语料中不存在的空占位文本。
+- `src/settings_view.rs`：`hotkeys_page` 拆为列表前（条件警告，equiv L1336-L1340
+  hasNativeBrightnessHotkey）与 `hotkeys_page_post`（break/scroll/amount/invert/TOD，
+  修正 FTL 键）；新增 `build_post_items()`；`sleepAction`（TOD）从显示器页移回
+  热键页（原版该下拉只在热键页 TOD 区）；移除 hotkeyPercent 页面行。
+- `src/settings_host.rs`：`add_hotkey`/`remove_hotkey` 返回快照；回调补全
+  apply_side_effects（下发 worker）+ schedule_write_settings（333ms 防抖落盘）+
+  `panel_controller::reapply_hotkeys`（equiv processSettings L1272-L1274）+
+  `refresh_hotkey_models`（热键列表 + 当前页 items/items_after 全量重建，
+  equiv sendToAllWindows('settings-updated')）；全部 items 重建点补 items_after。
+- `src/panel_controller.rs`：新增 `reapply_hotkeys()`，经 SYSTEM_EVENTS_SLOT
+  在主线程触达 SystemEvents::apply_hotkeys_now。
+- `src/app.rs` + `main.rs`：`--ui-demo=<page>` 支持指定设置窗口初始页
+  （修正 parse 只匹配裸 `--ui-demo` 的缺陷）；demo 设置窗口不再被
+  「有显示器」分支包裹（热键等页面无显示器也可对拍）；
+  `--ui-smoke` 新增 2b 段：热键增删全链 invoke 自检。
+
+### 对拍验证
+
+- 真机 `--ui-demo=hotkeys`（注入 3 条演示热键）截图逐项核对：
+  Hotkeys 标题 + 说明 + ⚠️ 原生亮度警告（条件出现）+ 3 行热键
+  （BrightnessUp / Control+Shift+Up / 空行）+ "Press keys here" + 删除钮 +
+  "+ Add Hotkey" + Hotkeys break linked levels + Tray icon scroll shortcut +
+  Amount to scroll(10) + Invert scroll + Turn Off Displays action 下拉(ddcci) +
+  TOD 注记 + DDC 警告——与原版 SettingsWindow.jsx L1608-L1668 一一对应。
+- `--ui-smoke` 2b：invoke_hotkey_add → 模型 1→2、settings 2 条；
+  invoke_hotkey_remove → 模型 2→1、文件落盘 1 条（`hotkey chain OK (file=1)`）。
+- 注：沙箱注入点击（mouse_event/SendInput）不达 Slint 窗口，交互验证以
+  invoke 链路 + 真机截图替代；键位录制（SETTINGS_HOTKEYS_PRESS_KEYS_HINT 按钮
+  的 WH_KEYBOARD_LL 录制）仍未实现，维持现状不阻塞本项。
+
+### 回归测试
+
+新增 4 用例：`hotkeys_pre_items_and_conditional_native_warn`、
+`hotkeys_post_items_match_origin_sections`、`monitors_page_has_no_sleep_action`、
+`hotkey_add_and_remove`（补快照断言）。`cargo test --workspace` 152 passed / 0 failed；
+`cargo build --workspace` 零错误。

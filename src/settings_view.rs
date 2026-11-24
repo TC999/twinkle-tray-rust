@@ -229,6 +229,16 @@ pub fn build_items(page_id: &str, settings: &Value) -> Vec<SettingsItem> {
     b.finish()
 }
 
+/// 构建某一页主列表**之后**的设置项（原版部分页面的 pageSection 位于热键
+/// 列表/显示器卡片之后；当前仅 hotkeys 页需要，equiv L1627-L1667）。
+pub fn build_post_items(page_id: &str, settings: &Value) -> Vec<SettingsItem> {
+    let mut b = ItemBuilder::new();
+    if page_id == "hotkeys" {
+        hotkeys_page_post(&mut b, settings);
+    }
+    b.finish()
+}
+
 /// 调试页（equiv SettingsWindow.jsx L1722-L1798 的 pageSection debug 两段）。
 /// 原版各设置项硬编码英文标题；此处走 FTL 回退链（en.ftl 提供，行为一致）。
 fn debug_page(b: &mut ItemBuilder, s: &Value) {
@@ -474,18 +484,8 @@ fn monitors_page(b: &mut ItemBuilder, s: &Value) {
         "SETTINGS_MONITORS_HIDE_INTERNAL_DESC",
         s,
     );
-    b.select(
-        "sleepAction",
-        "SETTINGS_MONITORS_SLEEP_ACTION_TITLE",
-        "SETTINGS_MONITORS_SLEEP_ACTION_DESC",
-        s,
-        &[
-            ("none", "None".to_string()),
-            ("ps", "PowerShell".to_string()),
-            ("ddcci", "DDC/CI".to_string()),
-            ("ps_ddcci", "PowerShell + DDC/CI".to_string()),
-        ],
-    );
+    // sleepAction（TOD）不在显示器页——原版该下拉只出现在热键页
+    // 的 Turn Off Displays 区（SettingsWindow.jsx L1659-L1667），已移至 hotkeys_page_post。
     b.number(
         "ddcPowerOffValue",
         "SETTINGS_FEATURES_POWER_TITLE",
@@ -587,31 +587,85 @@ fn time_page(b: &mut ItemBuilder, s: &Value) {
 }
 
 /// 热键页（equiv L1610-L1660；热键列表单独渲染）。
+/// 热键页（列表之前的部分，equiv SettingsWindow.jsx L1608-L1625）：
+/// 标题 + 说明 + 原生亮度警告（仅当热键含 BrightnessUp/BrightnessDown 时显示，
+/// equiv L1336-L1340 hasNativeBrightnessHotkey）。列表本体由 Slint hotkeys 分支渲染。
 fn hotkeys_page(b: &mut ItemBuilder, s: &Value) {
     b.section(&tt_localize::t("SETTINGS_HOTKEYS_TITLE"));
     b.note(&tt_localize::t("SETTINGS_HOTKEYS_DESC"));
-    b.note(&tt_localize::t("SETTINGS_HOTKEYS_NATIVE_BRIGHTNESS_WARN"));
-    b.note(&tt_localize::t("SETTINGS_HOTKEYS_NATIVE_BRIGHTNESS_CHECK"));
+    if has_native_brightness_hotkey(s) {
+        b.note(&format!(
+            "⚠️ {}",
+            tt_localize::t("SETTINGS_HOTKEYS_NATIVE_BRIGHTNESS_WARN")
+        ));
+        b.note(&tt_localize::t("SETTINGS_HOTKEYS_NATIVE_BRIGHTNESS_CHECK"));
+    }
+}
+
+/// 热键页（列表之后的部分，equiv SettingsWindow.jsx L1627-L1667）：
+/// break linked levels / 托盘滚动快捷键 / TOD（关闭显示器动作）。
+fn hotkeys_page_post(b: &mut ItemBuilder, s: &Value) {
     b.toggle(
         "hotkeysBreakLinkedLevels",
         "SETTINGS_HOTKEYS_BREAK_TITLE",
         "SETTINGS_HOTKEYS_BREAK_DESC",
         s,
     );
+    b.section(&tt_localize::t("SETTINGS_GENERAL_SCROLL_TITLE"));
     b.toggle(
         "scrollShortcut",
         "SETTINGS_GENERAL_SCROLL_TITLE",
         "SETTINGS_GENERAL_SCROLL_DESC",
         s,
     );
-    b.number("scrollShortcutAmount", "SETTINGS_HOTKEYS_SCROLL_AMOUNT_TITLE", "", s);
+    // equiv L1649-L1656：Amount to scroll 数值输入（键 SETTINGS_HOTKEYS_SCROLL_AMOUNT）
+    b.number("scrollShortcutAmount", "SETTINGS_HOTKEYS_SCROLL_AMOUNT", "", s);
     b.toggle(
         "invertScroll",
         "SETTINGS_HOTKEYS_INVERT_SCROLL_TITLE",
         "SETTINGS_HOTKEYS_INVERT_SCROLL_DESC",
         s,
     );
-    b.number("hotkeyPercent", "SETTINGS_HOTKEYS_PERCENT_TITLE", "", s);
+    // TOD（equiv L1659-L1667：Turn Off Displays action 下拉 + 注记 + DDC 警告）
+    let sleep_action = s
+        .get("sleepAction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ps");
+    b.select(
+        "sleepAction",
+        "SETTINGS_HOTKEYS_TOD_TITLE",
+        "SETTINGS_HOTKEYS_TOD_DESC",
+        s,
+        &[
+            ("none", tt_localize::t("SETTINGS_HOTKEYS_TOD_NONE")),
+            ("ps", tt_localize::t("SETTINGS_HOTKEYS_TOD_SOFT")),
+            ("ddcci", tt_localize::t("SETTINGS_HOTKEYS_TOD_HARD")),
+            ("ps_ddcci", tt_localize::t("SETTINGS_HOTKEYS_TOD_BOTH")),
+        ],
+    );
+    b.note(&tt_localize::t("SETTINGS_HOTKEYS_TOD_NOTE"));
+    if sleep_action == "ddcci" || sleep_action == "ps_ddcci" {
+        b.note(&format!(
+            "⚠️ {}",
+            tt_localize::t("GENERIC_DDC_WARNING")
+        ));
+    }
+}
+
+/// 热键列表是否包含原生亮度键（equiv SettingsWindow.jsx L1336-L1340：
+/// hotkeys.some(h => h.accelerator === "BrightnessUp" || "BrightnessDown")）。
+fn has_native_brightness_hotkey(s: &Value) -> bool {
+    s.get("hotkeys")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter().any(|h| {
+                matches!(
+                    h.get("accelerator").and_then(|v| v.as_str()),
+                    Some("BrightnessUp") | Some("BrightnessDown")
+                )
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// 光感页（equiv LightSensorSettings.jsx）。
@@ -1079,5 +1133,73 @@ mod tests {
         assert_eq!(hotkeys.len(), 1);
         assert_eq!(hotkeys[0].accelerator, "Control+Shift+Up");
         assert_eq!(hotkeys[0].summary, "brightness 10");
+    }
+
+    #[test]
+    fn hotkeys_pre_items_and_conditional_native_warn() {
+        // 无原生亮度键：仅标题 + 说明（equiv L1336-L1340 条件不满足）
+        let plain = json!({"hotkeys": [{"accelerator": "Control+Shift+Up"}]});
+        let pre = build_items("hotkeys", &plain);
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0].title, tt_localize::t("SETTINGS_HOTKEYS_TITLE"));
+        assert_eq!(pre[1].title, tt_localize::t("SETTINGS_HOTKEYS_DESC"));
+
+        // 含 BrightnessUp：追加两条原生亮度警告（equiv L1612-L1617）
+        let native = json!({"hotkeys": [{"accelerator": "BrightnessUp"}]});
+        let pre2 = build_items("hotkeys", &native);
+        assert_eq!(pre2.len(), 4);
+        assert!(pre2[2]
+            .title
+            .contains(&tt_localize::t("SETTINGS_HOTKEYS_NATIVE_BRIGHTNESS_WARN")));
+        assert_eq!(
+            pre2[3].title,
+            tt_localize::t("SETTINGS_HOTKEYS_NATIVE_BRIGHTNESS_CHECK")
+        );
+    }
+
+    #[test]
+    fn hotkeys_post_items_match_origin_sections() {
+        let s = json!({
+            "hotkeysBreakLinkedLevels": true,
+            "scrollShortcut": false,
+            "scrollShortcutAmount": 10,
+            "invertScroll": false,
+            "sleepAction": "ddcci"
+        });
+        let post = build_post_items("hotkeys", &s);
+        let keys: Vec<&str> = post
+            .iter()
+            .filter(|i| !i.key.is_empty())
+            .map(|i| i.key.as_str())
+            .collect();
+        // 顺序与原版一致：break → scrollShortcut → amount → invert → TOD
+        assert_eq!(
+            keys,
+            vec![
+                "hotkeysBreakLinkedLevels",
+                "scrollShortcut",
+                "scrollShortcutAmount",
+                "invertScroll",
+                "sleepAction"
+            ]
+        );
+        // 滚动量标题走正确键（SETTINGS_HOTKEYS_SCROLL_AMOUNT，非不存在的 *_TITLE）
+        assert_eq!(
+            post.iter().find(|i| i.key == "scrollShortcutAmount").unwrap().title,
+            tt_localize::t("SETTINGS_HOTKEYS_SCROLL_AMOUNT")
+        );
+        // sleepAction == ddcci 时 DDC 警告出现（equiv L1665-L1667）
+        assert!(post
+            .iter()
+            .any(|i| i.title.contains(&tt_localize::t("GENERIC_DDC_WARNING"))));
+        // 其他页无列表后置项
+        assert!(build_post_items("general", &s).is_empty());
+    }
+
+    #[test]
+    fn monitors_page_has_no_sleep_action() {
+        // 原版 sleepAction 只在热键页 TOD 区，不在显示器页
+        let items = build_items("monitors", &json!({}));
+        assert!(items.iter().all(|i| i.key != "sleepAction"));
     }
 }

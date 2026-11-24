@@ -235,7 +235,7 @@ fn main() {
 
     // --ui-demo：显示面板/设置窗口的实景渲染（真机截图验证用）
     if opts.ui_demo {
-        run_ui_demo(&host, &settings);
+        run_ui_demo(&host, &settings, opts.ui_demo_page.as_deref());
         host.manager.set_quitting(true);
         host.manager.stop();
         return;
@@ -623,7 +623,7 @@ fn ddc_brightness_vcps(settings: &serde_json::Value) -> serde_json::Value {
 
 /// --ui-demo：真实渲染面板与设置窗口（供真机截图对拍）。
 /// 注入 worker 真实枚举结果 + 一份演示用的扩展特征，覆盖两条渲染分支。
-fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value) {
+fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value, demo_page: Option<&str>) {
     host.refresh_monitors(true, true);
     let start = std::time::Instant::now();
     while start.elapsed().as_millis() < 30_000 {
@@ -697,26 +697,33 @@ fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value)
             panel.set_visible_count(visible);
             let _ = panel.window().set_position(slint::PhysicalPosition::new(60, 60));
             let _ = panel.show();
-
-            // 设置窗口：走真实 open_settings_window 路径（验证 monitors 模型注入与刷新接线），
-            // 再切到 monitors 页供截图对拍。此前这里手工 set_monitors，掩盖了
-            // "真实打开路径从不注入显示器列表" 的缺陷。
-            let settings_shared = std::sync::Arc::new(std::sync::Mutex::new(demo_settings.clone()));
-            match twinkle_tray_rust::settings_host::open_settings_window(settings_shared, host.clone()) {
-                Ok(handle) => {
-                    let ui = &handle.ui;
-                    ui.set_active_page("monitors".into());
-                    ui.set_items(slint::ModelRc::new(slint::VecModel::from(
-                        twinkle_tray_rust::settings_view::build_items("monitors", &demo_settings),
-                    )));
-                    let _ = ui.window().set_position(slint::PhysicalPosition::new(440, 60));
-                    println!("demo windows shown (panel + settings/monitors)");
-                    println!("settings monitors: {}", handle.monitors_model.row_count());
-                    let _ = slint::run_event_loop_until_quit();
-                }
-                Err(e) => println!("settings window FAILED: {}", e),
-            }
         }
+    } else {
+        println!("demo: no monitors enumerated; panel skipped");
+    }
+
+    // 设置窗口：走真实 open_settings_window 路径（验证 monitors 模型注入与刷新接线）。
+    // 热键等不依赖显示器的页面在无显示器时也可对拍，故不再被有显示器分支包裹。
+    // 此前这里手工 set_monitors，掩盖了"真实打开路径从不注入显示器列表"的缺陷。
+    let settings_shared = std::sync::Arc::new(std::sync::Mutex::new(demo_settings.clone()));
+    match twinkle_tray_rust::settings_host::open_settings_window(settings_shared, host.clone()) {
+        Ok(handle) => {
+            let ui = &handle.ui;
+            // 初始页：--ui-demo=<page> 指定（默认 monitors；供各页截图对拍）
+            let page = demo_page.unwrap_or("monitors");
+            ui.set_active_page(page.into());
+            ui.set_items(slint::ModelRc::new(slint::VecModel::from(
+                twinkle_tray_rust::settings_view::build_items(page, &demo_settings),
+            )));
+            ui.set_items_after(slint::ModelRc::new(slint::VecModel::from(
+                twinkle_tray_rust::settings_view::build_post_items(page, &demo_settings),
+            )));
+            let _ = ui.window().set_position(slint::PhysicalPosition::new(440, 60));
+            println!("demo windows shown (panel + settings/{})", page);
+            println!("settings monitors: {}", handle.monitors_model.row_count());
+            let _ = slint::run_event_loop_until_quit();
+        }
+        Err(e) => println!("settings window FAILED: {}", e),
     }
 }
 
@@ -796,6 +803,61 @@ fn run_ui_smoke(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value
             )));
         }
         Err(e) => println!("settings window FAILED: {}", e),
+    }
+
+    // 2b) 热键增删链路（走真实 open_settings_window 接线）：
+    // invoke hotkey-add → settings 写回 + 模型刷新 + 落盘；
+    // invoke hotkey-remove(id) → 反向断言。equiv addHotkey / deleteHotkey 全链。
+    {
+        let demo = serde_json::json!({
+            "checkForUpdates": false,
+            "hotkeys": [{
+                "id": "hk-smoke-1",
+                "accelerator": "",
+                "actions": [{"target": "brightness", "type": "offset", "value": 10,
+                             "values": [10], "allMonitors": true, "monitors": {}}]
+            }]
+        });
+        let shared = Arc::new(Mutex::new(demo));
+        // 落盘指向临时文件，避免污染真实 settings
+        let smoke_file = std::env::temp_dir().join("tt-ui-smoke-settings.json");
+        let prev_path = std::env::var("TT_SETTINGS_PATH").ok();
+        std::env::set_var("TT_SETTINGS_PATH", &smoke_file);
+        match twinkle_tray_rust::settings_host::open_settings_window(shared.clone(), host.clone()) {
+            Ok(handle) => {
+                let before = handle.ui.get_hotkeys().row_count();
+                handle.ui.invoke_hotkey_add();
+                let after_add = handle.ui.get_hotkeys().row_count();
+                let shared_now = shared.lock().unwrap().clone();
+                let new_id = shared_now["hotkeys"][1]["id"].as_str().unwrap_or("").to_string();
+                handle.ui.invoke_hotkey_remove(new_id.clone().into());
+                let after_remove = handle.ui.get_hotkeys().row_count();
+                println!(
+                    "hotkey chain: before={} after_add={} after_remove={}",
+                    before, after_add, after_remove
+                );
+                let list = shared.lock().unwrap()["hotkeys"].as_array().cloned().unwrap_or_default();
+                println!("settings hotkeys after remove: {}", list.len());
+                // 落盘（333ms 防抖）后回读
+                std::thread::sleep(std::time::Duration::from_millis(900));
+                let written = std::fs::read_to_string(&smoke_file)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .map(|v| v["hotkeys"].as_array().map(|a| a.len()).unwrap_or(0));
+                let written = written.unwrap_or(usize::MAX);
+                println!("settings file hotkeys written: {}", written);
+                let ok = before == 1 && after_add == 2 && after_remove == 1
+                    && list.len() == 1 && written == 1;
+                println!("hotkey chain {} (file={})", if ok { "OK" } else { "MISMATCH" },
+                    if written == usize::MAX { "missing".to_string() } else { written.to_string() });
+            }
+            Err(e) => println!("hotkey chain settings window FAILED: {}", e),
+        }
+        match prev_path {
+            Some(p) => std::env::set_var("TT_SETTINGS_PATH", p),
+            None => { std::env::remove_var("TT_SETTINGS_PATH"); }
+        }
+        let _ = std::fs::remove_file(&smoke_file);
     }
 
     // 3) Intro / HUD 窗口

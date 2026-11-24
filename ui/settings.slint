@@ -342,6 +342,8 @@ export component SettingsWindow inherits Window {
     // ---- 数据（Rust 侧注入）----
     in-out property <[SettingsPage]> pages: [];
     in-out property <[SettingsItem]> items: [];
+    // 主列表之后的设置项（原版部分 pageSection 位于热键列表之后；仅 hotkeys 页非空）
+    in-out property <[SettingsItem]> items-after: [];
     in-out property <[SettingsMonitorEntry]> monitors: [];
     in-out property <[SettingsHotkey]> hotkeys: [];
     in-out property <string> active-page: "general";
@@ -358,7 +360,6 @@ export component SettingsWindow inherits Window {
     in-out property <string> t-hotkeys-add: "";
     in-out property <string> t-hotkeys-remove: "";
     in-out property <string> t-hotkeys-record: "";
-    in-out property <string> t-no-hotkeys: "";
     in-out property <string> t-ddc-warning: "";
     in-out property <string> t-move-up: "";
     in-out property <string> t-move-down: "";
@@ -664,14 +665,19 @@ export component SettingsWindow inherits Window {
                             }
                         }
 
-                        // 热键页（equiv hotkeys 页）
+                        // 热键页（equiv hotkeys 页 L1608-L1668：
+                        //   列表前设置项 → 热键列表 + 新增 → 列表后设置项）
                         if (root.active-page == "hotkeys") : VerticalLayout {
                             spacing: 6px;
-                            if (root.hotkeys.length == 0) : Text {
-                                text: root.t-no-hotkeys;
-                                font-size: 12px;
-                                color: Theme.text-mid;
+                            // 标题/说明/原生亮度警告（equiv L1609-L1618）
+                            SettingsItems {
+                                items: root.items;
+                                item-toggle(k, v) => { root.item-toggle(k, v); }
+                                item-choice(k, v) => { root.item-choice(k, v); }
+                                item-button(k) => { root.item-button(k); }
                             }
+                            // 热键列表（equiv getHotkeyList L753-L820 的简化行 +
+                            // "+ Add Hotkey" L1619-L1625；原版列表为空时无占位文本）
                             for hotkey in root.hotkeys : Rectangle {
                                 height: 40px;
                                 border-radius: 4px;
@@ -726,6 +732,13 @@ export component SettingsWindow inherits Window {
                                 border-color: Theme.button-border;
                                 Text { text: "+ " + root.t-hotkeys-add; font-size: 12px; color: Theme.text; vertical-alignment: center; horizontal-alignment: center; }
                                 TouchArea { clicked => { root.hotkey-add(); } }
+                            }
+                            // 列表后设置项：break linked levels / 滚动 / TOD（equiv L1627-L1667）
+                            SettingsItems {
+                                items: root.items-after;
+                                item-toggle(k, v) => { root.item-toggle(k, v); }
+                                item-choice(k, v) => { root.item-choice(k, v); }
+                                item-button(k) => { root.item-button(k); }
                             }
                         }
 
