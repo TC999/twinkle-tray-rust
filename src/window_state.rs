@@ -130,6 +130,50 @@ pub fn system_uses_dark_mode() -> bool {
     }
 }
 
+/// 系统任务栏深浅色（equiv lastTheme.SystemUsesLightTheme：读注册表
+/// SystemUsesLightTheme）。托盘图标目录由此决定（getTrayIconPath L2459）：
+/// 系统用浅色任务栏 → light（黑图标），深色任务栏 → dark（白图标）。
+/// 注意与 AppsUseLightTheme 是两个不同的值，不可混用。
+pub fn system_uses_light_theme() -> bool {
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+        REG_DWORD,
+    };
+    let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16()
+        .collect();
+    let value_name: Vec<u16> = "SystemUsesLightTheme\0".encode_utf16().collect();
+    // SAFETY: 子键/值名为合法 NUL 结尾宽字符串；句柄在使用后立即关闭。
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            windows::core::PCWSTR::from_raw(subkey.as_ptr()),
+            None,
+            KEY_READ,
+            &mut key,
+        )
+        .is_err()
+        {
+            return false; // 读不到时按深色任务栏（原版 lastTheme 缺省为暗）
+        }
+        let mut data: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let mut ty = REG_DWORD;
+        let ok = RegQueryValueExW(
+            key,
+            windows::core::PCWSTR::from_raw(value_name.as_ptr()),
+            None,
+            Some(&mut ty),
+            Some(&mut data as *mut u32 as *mut u8),
+            Some(&mut size),
+        )
+        .is_ok();
+        let _ = RegCloseKey(key);
+        ok && data != 0
+    }
+}
+
 /// 系统 locale（equiv app.getLocale()）。
 /// 主进程启动装载与设置页语言切换共用（equiv getLocalization L2242-L2253 的检测输入）。
 pub fn system_locale() -> String {

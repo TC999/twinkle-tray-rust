@@ -372,12 +372,13 @@ fn start_tray(
         .get("icon")
         .and_then(|v| v.as_str())
         .unwrap_or("icon");
-    let dark = settings
-        .get("theme")
-        .and_then(|v| v.as_str())
-        .map(|t| t == "dark")
-        .unwrap_or(true);
-    let dir = if dark { "dark" } else { "light" };
+    // equiv electron.js L2459-L2461: themeDir = SystemUsesLightTheme ? 'light' : 'dark'
+    // 图标跟随系统任务栏深浅色（深色任务栏 = dark 目录 = 白图标），不随应用内主题设置。
+    let dir = if twinkle_tray_rust::window_state::system_uses_light_theme() {
+        "light"
+    } else {
+        "dark"
+    };
     let file = format!("{}.ico", icon_name);
     // 图标资产搜索链（AGENTS.md §1.2：加载预生成 ico，禁止自绘）：
     // 1) exe 目录旁 assets/tray-icons（发布布局：assets 随 exe 部署）
