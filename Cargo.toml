@@ -29,7 +29,16 @@ monitor-thread-manager = { path = "crates/monitor-thread-manager" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ddcci = { path = "crates/ddcci" }
-slint = { version = "1.19", features = ["backend-winit", "renderer-femtovg"] }
+# i-slint-core：与 slint 1.19 同源（slint 的传递依赖，同版本），只为拿 Window::window_handle()
+# 取 HWND 供 DPI 换算用；依赖树无净增（AGENTS.md §1.1 论证见 PROGRESS Round 16）。
+# raw-window-handle：同理，i-slint-core 的同版本传递依赖，用来解读上面那个 handle。
+# 离线构建前需执行一次 tools/slint-winit-patch/apply.ps1（给 slint 的 winit 后端补
+# BackendBuilder::with_window_msg_hook，见 src/window_drag.rs）。
+# unstable-winit-030：只用 winit 的 EventLoopBuilder 装消息钩子（模态循环补充泵，
+# 见 src/window_drag.rs）；feature 已强制包含 backend-winit，不引入新 crate。
+slint = { version = "1.19", features = ["backend-winit", "renderer-femtovg", "unstable-winit-030"] }
+i-slint-core = { version = "=1.19.0", features = ["raw-window-handle-06"] }
+raw-window-handle = "0.6"
 wmibridge = { path = "crates/wmibridge" }
 twutils = { path = "crates/twutils" }
 displayconfig = { path = "crates/displayconfig" }

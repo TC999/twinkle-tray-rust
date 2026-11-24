@@ -1,0 +1,14 @@
+// winit/slint 上游缺失的「事件循环消息钩子」包装入口（离线构建补丁，见 PROGRESS Round 16）。
+// 上游只有 EventLoopBuilder / WindowAttributes 上的 with_msg_hook；这里在 BackendBuilder
+// 上补一个同名入口，供宿主在处理无边框窗口拖动时补充泵送消息。
+/// 给此后由本后端创建的全部窗口指定 winit 事件循环消息钩子。
+///
+/// 返回 true 表示钩子已处理该消息（winit 不再 Translate/Dispatch）。
+#[must_use]
+pub fn with_window_msg_hook(
+    mut self,
+    hook: impl FnMut(*const core::ffi::c_void) -> bool + 'static,
+) -> Self {
+    self.window_msg_hook = Some(Box::new(hook));
+    self
+}

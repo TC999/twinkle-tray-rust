@@ -24,7 +24,15 @@ export component IntroWindow inherits Window {
         spacing: 14px;
         alignment: start;
 
-        // logo（equiv <img src={AppLogo} />，用文字标识代替位图以保持纯 Slint 资产）
+        // logo（equiv <img src={AppLogo} />，用文字标识代替位图以保持纯 Slint 资产）。
+        // 首次引导窗口原版同样是无框（IntroWindow.jsx 无标题栏），窗口自身没有可拖拽的
+        // 原生标题栏；顶部标题区因此兼作 -webkit-app-region: drag 的等价拖动区域，
+        // 否则该窗口在屏幕上一旦出现就再也挪不动。
+        Rectangle {
+            height: 26px;
+            background: transparent;
+            WindowMoveArea { }
+        }
         Text {
             text: "Twinkle Tray";
             font-size: 26px;

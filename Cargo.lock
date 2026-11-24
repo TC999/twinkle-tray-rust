@@ -4017,6 +4017,7 @@ dependencies = [
  "const-field-offset",
  "i-slint-backend-linuxkms",
  "i-slint-backend-selector",
+ "i-slint-backend-winit",
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",
@@ -4619,8 +4620,10 @@ version = "0.1.0"
 dependencies = [
  "ddcci",
  "displayconfig",
+ "i-slint-core",
  "monitor-thread-manager",
  "monitor-worker",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "slint",

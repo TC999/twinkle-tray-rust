@@ -202,6 +202,42 @@ pub fn apply_window_material(hwnd: isize, settings: &Value) {
     }
 }
 
+/// 窗口句柄的 Win32 原始值（winit → raw-window-handle 0.6）。
+///
+/// 面板定位需要"物理像素 ↔ 逻辑像素"换算时才拿到 HWND（`GetDpiForWindow`）；
+/// 必须在窗口已 show、且处在创建它的线程（主线程）上调用。
+pub fn window_hwnd(window: &slint::Window) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle();
+    match handle.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+        _ => None,
+    }
+}
+
+/// 窗口自身所在 DPI / 96 的比例（物理像素 ÷ 逻辑像素）。
+///
+/// 与 `Window::scale_factor()` 的区别：Slint 报告的 scale_factor 是"UI 渲染比例"，
+/// 可以来自系统/应用级 DPI 设置；而 winit 的 `set_position` 最终走
+/// `SetWindowPos` 并按 `GetDpiForWindow(hwnd)` 做逻辑→物理换算。二者不一致时
+/// （窗口被拖到不同 DPI 的显示器、或应用级 DPI 覆盖与系统不同），用 scale_factor
+/// 预先换算会让窗口落在别处——这正是"设置窗口实际出现在 (192,192) 而不是 (440,60)"
+/// 的成因。HWND 拿不到时退回 scale_factor（等价原行为，不新增失败路径）。
+pub fn window_dpi_scale(window: &slint::Window) -> f32 {
+    let fallback = window.scale_factor();
+    let Some(hwnd) = window_hwnd(window) else {
+        return fallback;
+    };
+    let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
+    // SAFETY: hwnd 来自本窗口自身的 raw handle，调用线程即窗口创建线程。
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+    if dpi > 0 {
+        dpi as f32 / 96.0
+    } else {
+        fallback
+    }
+}
+
 /// 任务栏位置 -> 面板贴边方向（equiv electron.js 的 panel-position / positionPanel）。
 /// 返回 (x, y) 相对屏幕的锚点语义由调用方解释。
 pub fn taskbar_position_to_panel_edge(position: &str) -> PanelEdge {

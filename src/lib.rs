@@ -16,6 +16,7 @@ pub mod update_host;
 pub mod settings_host;
 pub mod settings_view;
 pub mod ui_types;
+pub mod window_drag;
 pub mod window_state;
 pub mod worker_ipc;
 

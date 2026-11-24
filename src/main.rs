@@ -120,6 +120,27 @@ use twinkle_tray_rust::monitor_host::MonitorHost;
 use twinkle_tray_rust::worker_ipc;
 use slint::{ComponentHandle, Model};
 
+/// 选定 Slint 后端（winit + femtovg）并给 winit 事件循环装上模态循环补充泵。
+///
+/// 必须早于任何组件创建：Slint 只有在选后端时才会构建 winit 的 EventLoop，而 winit
+/// 0.30 的消息钩子只能在 EventLoopBuilder 上设置（见 window_drag 模块说明）。
+fn init_slint_backend() {
+    #[allow(unused_mut)]
+    let mut builder = slint::BackendSelector::new().backend_name("winit".into());
+    #[cfg(target_os = "win32")]
+    {
+        use slint::winit_030::winit;
+        use winit::platform::windows::EventLoopBuilderExtWindows as _;
+        let mut event_loop_builder =
+            slint::winit_030::EventLoopBuilder::<slint::winit_030::SlintEvent>::new();
+        event_loop_builder.with_msg_hook(twinkle_tray_rust::window_drag::modal_pump::msg_hook);
+        builder = builder.with_winit_event_loop_builder(event_loop_builder);
+    }
+    if let Err(e) = builder.select() {
+        eprintln!("Couldn't select the Slint backend: {}", e);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let opts = LaunchOptions::parse(&args);
@@ -129,6 +150,9 @@ fn main() {
         worker_ipc::run_monitor_worker(&args);
         return;
     }
+
+    // Slint 后端（winit + femtovg）与事件循环消息钩子：必须早于任何组件创建。
+    init_slint_backend();
 
     // 日志镜像：dev 或 --console 时同时输出到 stdout（equiv L37）
     logger::set_mirror_log(opts.is_dev || opts.has_console);
@@ -235,6 +259,11 @@ fn main() {
 
     // --ui-demo：显示面板/设置窗口的实景渲染（真机截图验证用）
     if opts.ui_demo {
+        if let Some(pos) = demo_window_position() {
+            if let Ok(mut slot) = DEMO_WINDOW_POS.lock() {
+                *slot = Some(pos);
+            }
+        }
         run_ui_demo(&host, &settings, opts.ui_demo_page.as_deref());
         host.manager.set_quitting(true);
         host.manager.stop();
@@ -621,6 +650,34 @@ fn ddc_brightness_vcps(settings: &serde_json::Value) -> serde_json::Value {
     merged
 }
 
+/// --ui-demo 的窗口摆位（0 = 不指定，交给 Slint 默认位置）。
+///
+/// 设定后第一个 Slint 窗口放在该物理坐标、第二个放在其右侧 +380：设置窗口宽 760，
+/// 面板宽 356，两者都能整窗可见，便于「按标题栏拖动」这类交互对拍时目视观察。
+static DEMO_WINDOW_POS: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+static DEMO_WINDOW_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn demo_window_position() -> Option<(i32, i32)> {
+    let args: Vec<String> = std::env::args().collect();
+    let raw = args.iter().find_map(|a| a.strip_prefix("--demo-pos="))?;
+    let (x, y) = raw.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// 按 --demo-pos 摆放窗口（物理像素 × 该窗口 DPI 比例，与 winit set_position 同口径）。
+/// 未指定时不动窗口，返回 false。
+fn place_demo_window(window: &slint::Window) -> bool {
+    let pos = DEMO_WINDOW_POS.lock().ok().and_then(|g| *g);
+    let Some((base_x, base_y)) = pos else {
+        return false;
+    };
+    let slot = DEMO_WINDOW_SLOT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let scale = twinkle_tray_rust::window_state::window_dpi_scale(window);
+    let x = (base_x as f32 + if slot == 0 { 0.0 } else { 380.0 }) * scale;
+    let _ = window.set_position(slint::PhysicalPosition::new(x as i32, base_y as i32));
+    true
+}
+
 /// --ui-demo：真实渲染面板与设置窗口（供真机截图对拍）。
 /// 注入 worker 真实枚举结果 + 一份演示用的扩展特征，覆盖两条渲染分支。
 fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value, demo_page: Option<&str>) {
@@ -695,7 +752,9 @@ fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value,
             }
             panel.set_monitors(slint::ModelRc::new(slint::VecModel::from(models)));
             panel.set_visible_count(visible);
-            let _ = panel.window().set_position(slint::PhysicalPosition::new(60, 60));
+            // demo 窗口的摆位：--demo-pos 指定时按物理坐标落位（与 winit 同口径换算，
+            // 物理 = 逻辑 × GetDpiForWindow/96）；未指定时保持 Slint 的默认摆位。
+            place_demo_window(panel.window());
             let _ = panel.show();
         }
     } else {
@@ -718,7 +777,7 @@ fn run_ui_demo(host: &std::sync::Arc<MonitorHost>, settings: &serde_json::Value,
             ui.set_items_after(slint::ModelRc::new(slint::VecModel::from(
                 twinkle_tray_rust::settings_view::build_post_items(page, &demo_settings),
             )));
-            let _ = ui.window().set_position(slint::PhysicalPosition::new(440, 60));
+            place_demo_window(ui.window());
             println!("demo windows shown (panel + settings/{})", page);
             println!("settings monitors: {}", handle.monitors_model.row_count());
             let _ = slint::run_event_loop_until_quit();

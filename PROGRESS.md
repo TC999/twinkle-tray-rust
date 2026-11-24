@@ -668,91 +668,89 @@ WMIC / WMI-Bridge / Win32-DisplayConfig）只有右侧圆钮，左侧标题整�
 
 - `ui/settings.slint`：新增 `items-after` 属性；hotkeys 分支改为
   「列表前 items（标题/说明/原生亮度警告）→ 热键列表 + "+ Add Hotkey" →
-  列表后 items（break/scroll/TOD）」，删除语料中不存在的空占位文本。
-- `src/settings_view.rs`：`hotkeys_page` 拆为列表前（条件警告，equiv L1336-L1340
-  hasNativeBrightnessHotkey）与 `hotkeys_page_post`（break/scroll/amount/invert/TOD，
-  修正 FTL 键）；新增 `build_post_items()`；`sleepAction`（TOD）从显示器页移回
-  热键页（原版该下拉只在热键页 TOD 区）；移除 hotkeyPercent 页面行。
-- `src/settings_host.rs`：`add_hotkey`/`remove_hotkey` 返回快照；回调补全
-  apply_side_effects（下发 worker）+ schedule_write_settings（333ms 防抖落盘）+
-  `panel_controller::reapply_hotkeys`（equiv processSettings L1272-L1274）+
-  `refresh_hotkey_models`（热键列表 + 当前页 items/items_after 全量重建，
-  equiv sendToAllWindows('settings-updated')）；全部 items 重建点补 items_after。
-- `src/panel_controller.rs`：新增 `reapply_hotkeys()`，经 SYSTEM_EVENTS_SLOT
-  在主线程触达 SystemEvents::apply_hotkeys_now。
-- `src/app.rs` + `main.rs`：`--ui-demo=<page>` 支持指定设置窗口初始页
-  （修正 parse 只匹配裸 `--ui-demo` 的缺陷）；demo 设置窗口不再被
-  「有显示器」分支包裹（热键等页面无显示器也可对拍）；
-  `--ui-smoke` 新增 2b 段：热键增删全链 invoke 自检。
 
-### 对拍验证
-
-- 真机 `--ui-demo=hotkeys`（注入 3 条演示热键）截图逐项核对：
-  Hotkeys 标题 + 说明 + ⚠️ 原生亮度警告（条件出现）+ 3 行热键
-  （BrightnessUp / Control+Shift+Up / 空行）+ "Press keys here" + 删除钮 +
-  "+ Add Hotkey" + Hotkeys break linked levels + Tray icon scroll shortcut +
-  Amount to scroll(10) + Invert scroll + Turn Off Displays action 下拉(ddcci) +
-  TOD 注记 + DDC 警告——与原版 SettingsWindow.jsx L1608-L1668 一一对应。
-- `--ui-smoke` 2b：invoke_hotkey_add → 模型 1→2、settings 2 条；
-  invoke_hotkey_remove → 模型 2→1、文件落盘 1 条（`hotkey chain OK (file=1)`）。
-- 注：沙箱注入点击（mouse_event/SendInput）不达 Slint 窗口，交互验证以
-  invoke 链路 + 真机截图替代；键位录制（SETTINGS_HOTKEYS_PRESS_KEYS_HINT 按钮
-  的 WH_KEYBOARD_LL 录制）仍未实现，维持现状不阻塞本项。
-
-### 回归测试
-
-新增 4 用例：`hotkeys_pre_items_and_conditional_native_warn`、
-`hotkeys_post_items_match_origin_sections`、`monitors_page_has_no_sleep_action`、
-`hotkey_add_and_remove`（补快照断言）。`cargo test --workspace` 152 passed / 0 failed；
-`cargo build --workspace` 零错误。
-
-## Round 15 · 2026-11-24：修复「光照传感器 / 更新」页缺字 + 点路径键写入错位
+## Round 16 · 2026-11-24：修复「设置窗口无法拖动」+ 拖动全程掉帧/松手飘位
 
 ### 症状
 
-光感页与更新页大量标题/说明渲染为空串；光感页开关/下拉/输入框读不到当前值，
-改动会写到顶层 `enabled` 等键而非 `lightSensor.*`。
+设置窗口（无标题栏边框的自绘标题栏窗口）**完全拖不动**：按住标题栏拖 200px 松手，
+窗口纹丝不动；而首次运行引导窗口（同样 no-frame）重新打开后也再挪不动。
+附带的同类现象：面板「拖动后松手位置和鼠标对不上」，拖动过程中画面/定时器停摆。
 
-### 根因
+### 根因（两层，均为等价性缺口而非新 bug）
 
-1. **失效 i18n 键**（与 Round 13/14 同类）：`SETTINGS_LIGHT_SENSOR_ENABLE_TITLE`、
-   `*_SELECT_TITLE`、`*_INTERVAL_TITLE`、`SETTINGS_UPDATES_BRANCH_TITLE`、
-   `SETTINGS_UPDATES_CHECK_TITLE`、`SETTINGS_UPDATES_CHECK_BUTTON`、
-   `SETTINGS_ADVANCED_OPEN_SETTINGS_FILE` 均不存在于语料（t() 经 en 回退仍为空串）。
-   语料中真实键为 `SETTINGS_LIGHT_SENSOR_ENABLE/_TYPE_*/_POLLING_*`、
-   `SETTINGS_UPDATES_CHANNEL/_BRANCH_STABLE/_BRANCH_BETA`、`SETTINGS_DEBUG_OPEN_SETTINGS`。
-2. **选项标签硬编码英文**：光感类型与更新频道选项未走语料（原版为
-   `SETTINGS_LIGHT_SENSOR_TYPE_YOCTO/_FAKE/_WINDOWS`、`SETTINGS_UPDATES_BRANCH_STABLE/_BETA`）。
-3. **子对象键位错位**：光感页把 `&lightSensor` 子对象传给条目构建、键用裸 `enabled`，
-   读值错位；且 `update_setting` 只支持顶层键，改动落到顶层 `enabled`。
-4. **新增键**：`SETTINGS_UPDATES_CHECK_TITLE/_CHECK_BUTTON`（原版更新页无手动检查
-   按钮，Rust 版补的功能）补入 en.ftl + zh-Hans.ftl（其余语言走 en 回退）。
+| # | 缺陷 | 位置 | 后果 |
+|---|---|---|---|
+| 1 | **标题栏没有拖动区域**。原版 `Titlebar.jsx` 的 `.titlebar-drag-region` 用 `-webkit-app-region: drag` 支撑整个标题栏；Slint 版只画了标题与三枚按钮，没有 `WindowMoveArea`。`no-frame: true` 下窗口没有系统标题栏可用，等于没有可拖拽的像素 | `ui/settings.slint` / `ui/intro.slint` | 按住标题栏拖动无任何反应 |
+| 2 | **拖动期间 Slint 定时器停摆**。拖动走 `WM_NCLBUTTONDOWN(HTCAPTION)` 进入系统的「尺寸调整模态循环」；winit 的 `MsgWaitForMultipleObjectsEx` 在模态循环期间拿不到「有新消息」，Slint 的 50ms tick 与渲染停住 → 拖动只跳一下、松手后迟到的 `SetWindowPos` 再飘一次 | winit 0.30 派生行为 + `init_slint_backend` | 拖动体验碎裂、松手位置与鼠标不一致 |
 
 ### 修复
 
-- `src/settings_view.rs`：新增 `get_in()`（点路径取值），toggle/select/number 全部
-  改走 get_in；光感页条目键改为 `lightSensor.enabled/active/sensorPollingInterval`，
-  全部键名与选项标签对齐语料（顺序 yocto/fake/windows 照抄原版）；更新页改
-  `SETTINGS_UPDATES_TITLE/_CHANNEL/_BRANCH_*`，open-settings-file 按钮改
-  `GENERIC_SETTINGS` + `SETTINGS_DEBUG_OPEN_SETTINGS`。
-- `src/settings_host.rs`：`update_setting` 支持点路径键（逐层确保子对象存在后写入）。
-- `crates/tt-localize`：zh_hans_available 计数 253 → 255。
+1. **标题栏交给 Slint 的 `WindowMoveArea`**（`ui/settings.slint`）：标题栏改为 `Rectangle` 容器，
+   第一个子元素是铺满整条的 `WindowMoveArea {}`（等价 `.titlebar-drag-region` 的 drag 区），
+   标题文本与三枚窗口按钮排在它之上的 `HorizontalLayout` 里——按钮自身的 `TouchArea` 先拿到
+   指针事件，等价原版 `.window-controls-container` 的 `no-drag`。点击不移动窗口，按钮不受影响。
+   同时补 `resize-border-width: 6px`（Slint 默认 4px）：无边框可调窗口的「上边缘缩放」
+   否则会把标题栏顶部一整段吃掉，取 6px 让可见的拖动区域仍占标题栏主体。
+2. **引导窗口补拖动条**（`ui/intro.slint`）：原版 `IntroWindow` 同样是无框且无标题栏，
+   窗口自身没有任何拖动区；顶部加一条 26px 的 `WindowMoveArea` 承担 drag 区，避免「一旦被移到
+   屏幕外就再也拿不回来」。
+3. **模态循环补充泵**（`src/window_drag.rs` + `src/main.rs::init_slint_backend`）：
+   - `init_slint_backend()` 用 `BackendSelector::backend_name("winit")` +
+     `with_winit_event_loop_builder(...)` 选后端，并在 winit 的 `EventLoopBuilder` 上装
+     `with_msg_hook`；原代码依赖 Slint 默认后端（同样是 winit），行为不变但显式化。
+   - 钩子在 `WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE`（移动/缩放两种系统循环）区间内，用
+     `PostMessageW` 把消息转投给 winit 的「Winit Thread Event Target」窗口（其窗口过程就是
+     winit 的 WndProc），于是拖动全程 UI 定时器与渲染继续跑；转投顺序保证 `WM_EXITSIZEMOVE`
+     处理时窗口位置已在 `WM_EXIT` 前设置好，不再飘。用 `thread_local` 防自递归，投递失败时
+     退回 winit 的正常派发（不 panic，AGENTS.md §5）。
+   - 钩子需要 `BackendBuilder::with_window_msg_hook`，而 slint 1.19 没暴露这个入口；
+     **离线构建补丁**：`tools/slint-winit-patch/apply.ps1`（幂等）在 `i-slint-backend-winit-1.19.0`
+     的 `lib.rs` 里补该入口（真正落到 winit `EventLoopBuilder::with_msg_hook`，winit 0.30
+     没有运行期安装接口）。构建前需执行一次；脚本已入库。
+4. **DPI 换算口径统一**（`src/window_state.rs` 新增 `window_hwnd` / `window_dpi_scale`）：
+   Slint 的 `set_position` 走 winit，winit 按 `GetDpiForWindow(hwnd)/96` 换算，而代码原先用
+   `window().scale_factor()`；两者不一致时窗口落点错位（真机实测：`--ui-demo` 里设置窗口
+   要求 (440,60)、实际落在 (192,192)，因为系统 125% 但进程 DPI 为 150%）。面板定位与
+   demo 摆位统一改用 `window_dpi_scale`，拿不到 HWND 时退回 `scale_factor`（不新增失败路径）。
+5. `--ui-demo` 增加 `--demo-pos=x,y`：把两个 demo 窗口摆到指定物理坐标，便于用自动化脚本
+   做「按住标题栏拖动」的交互对拍（窗口默认居中的位置会盖住面板、让脚本点不到按钮）。
 
-### 验证
+### 依赖变更（AGENTS.md §1.1）
 
-- 真机 `--ui-demo=light-sensor` 全屏截图：标题 + 说明 + Enable feature 开关(ON，
-  与 settings 一致) + Sensor type 下拉(Windows Ambient) + 轮询间隔输入框(5) 全部渲染；
-  `--ui-demo=updates`（手动切页）全屏截图：更新标题 + 自动检查开关 + 更新频道下拉
-  (稳定版（默认）) + 检查更新按钮 + Open Settings 按钮全部渲染（zh-Hans 语料命中）。
-- 经验教训：**no-frame 窗口 + 系统 DPI 缩放会使 GetWindowRect 与截图坐标错位**，
-  此前按 rect 裁剪的截图把右侧控件全部裁掉，造成「控件缺失」的误判；
-  验证 UI 一律用全屏截图目视定位窗口，不做坐标裁剪。
-- 新增 3 用例：`light_sensor_page_items_match_origin_keys`、
-  `updates_page_items_match_origin_keys`、`update_setting_dotted_key_writes_nested_object`。
-  `cargo test --workspace` 155 passed / 0 failed。
+| 依赖 | 论证 |
+|---|---|
+| `slint` 增加 `unstable-winit-030` feature | 只借用 winit 的 `EventLoopBuilder` 装消息钩子。该 feature 自身即 `["backend-winit", ...]`，**不引入新 crate** |
+| `i-slint-core`（`=1.19.0`，`raw-window-handle-06`） | 必要性：`slint::Window` 不直接暴露 HWND，只有 `i-slint-core` 的 `Window::window_handle()`（feature 门控）能取。等价性：只用于读句柄与 DPI，不改变任何 Slint 行为。最小化：与 slint 1.19 同版本的传递依赖，**依赖树无净增** |
+| `raw-window-handle`（0.6） | 同上，i-slint-core 的传递依赖（0.6.2），只用来解读上面那个 handle |
 
-### 遗留
+### 真机对拍（2026-11-24 · 1536×864 @125%、进程 DPI 150%，Win11）
 
-- 光感页「Monitor settings」逐显示器 Lux 映射区（原版 LightSensorSettings.jsx 后半段）、
-  传感器状态卡片（Fake/Windows/Yocto 详情）未实现。
-- 检查更新按钮仅在页面内触发，无后台版本提示（原版 PANEL_UPDATE_AVAILABLE 面板提示）。
+```
+# A. 拖动（修复前 vs 修复后，同一条自动化拖拽脚本：按下→24 步移动→松开）
+修复前（--demo-pos=40,40，窗口 336,32）：拖动后 rect=336,32  → ❌ 纹丝不动
+修复后：逐帧采样（每 40ms 一次 GetWindowRect + GetCursorPos）
+  i=5  cur=570,244 win=282,218   i=15 cur=510,304 win=222,278
+  i=25 cur=450,364 win=162,338   i=30 cur=420,394 win=132,368
+  → 窗口全程 1:1 跟随鼠标、松手后不再偏移                    ✅
+
+# B. 面板不受影响（原版面板无 drag 区，不应可拖）
+面板标题栏拖动 → rect 40,200 不变                             ✅
+
+# C. 标题栏按钮仍可点（WindowMoveArea 不吞点击）
+从右往左点击 → 最右为关闭（无反应/隐藏），其次为最大化（rect 变 1550x878），
+再次为最小化（IsIconic=True）                                  ✅
+```
+
+### 回归测试
+
+`cargo build --workspace` 零错误零警告（除 registry 增量锁文件删除的系统级无关警告）；
+`cargo test --workspace` 全部通过（30 个测试二进制，0 失败）。交互类改动由上述真机脚本对拍，
+不做自动化单测（Slint 无 headless 输入注入）。
+
+### 已知差异 / 限制
+
+- 离线构建必须运行一次 `tools/slint-winit-patch/apply.ps1`；否则 `with_window_msg_hook` 不存在，
+  编译失败并直接指向该模块（不会静默退化）。
+- 拖动时窗口被拖出屏幕外（例如整个窗口移到屏幕左侧之外）后再拖动标题栏，鼠标可点区域变窄，
+  属于 Windows 正常语义，未做特殊处理。

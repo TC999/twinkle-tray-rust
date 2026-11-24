@@ -1280,11 +1280,16 @@ fn default_panel_position(ui: &crate::PanelWindow) -> slint::PhysicalPosition {
         gap = g as i32;
     }
     // Slint 的 window().set_position 走 winit 的 LogicalPosition 语义：
-    // 传物理坐标会被再乘一次 scale_factor，导致 DPI≠100% 时窗口跑到屏幕外
+    // 传物理坐标会被再乘一次，导致 DPI≠100% 时窗口跑到屏幕外
     // （真机缺陷：120 DPI 下面板落在 1940,1123 而屏幕仅 1920x1080）。
     // 因此这里统一用逻辑像素（equiv Electron 的 DIP 坐标）计算。
+    //
+    // 注意乘数不是 window().scale_factor()：winit 的 SetWindowPos 换算用的是
+    // GetDpiForWindow(hwnd)/96，二者不一致时（系统 150% + 应用级 DPI 覆盖等）窗口
+    // 会落到别处。统一改用 window_state::window_dpi_scale（拿不到 HWND 时退回
+    // scale_factor，不新增失败路径）。
     let size = ui.window().size();
-    let scale = ui.window().scale_factor();
+    let scale = crate::window_state::window_dpi_scale(ui.window());
     let w = (size.width as f32 / scale).round() as i32;
     let h = (size.height as f32 / scale).round() as i32;
     // equiv screen.getPrimaryDisplay().workAreaSize（electron.js:L4065-L4118 的定位基准）：
