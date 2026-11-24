@@ -264,6 +264,10 @@ fn run_panel_controller_inner(
 ) -> Result<(), String> {
     let panel = crate::PanelWindow::new().map_err(|e| e.to_string())?;
     let weak = panel.as_weak();
+    // 面板句柄存入主线程槽位：设置窗口的主题/语言变更需要联动刷新面板
+    PANEL_WINDOW.with(|slot| {
+        *slot.borrow_mut() = Some(panel.as_weak());
+    });
 
     let initial_settings = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
     // 面板定位的 settings 快照（default_panel_position 读 overrideTaskbarPosition/Gap）
@@ -356,6 +360,29 @@ thread_local! {
     /// SystemEvents 主线程槽位(由 run_panel_controller_with_runtime 安装)。
     static SYSTEM_EVENTS_SLOT: std::cell::RefCell<Option<crate::system_events::SystemEvents>> =
         const { std::cell::RefCell::new(None) };
+    /// 面板窗口槽位（主线程独占，存 Weak：强引用仍由 run 函数持有）。
+    /// 设置窗口改主题/语言时联动刷新面板
+    /// （equiv sendToAllWindows('theme-settings', ...) / getLocalization 的全窗口广播）。
+    static PANEL_WINDOW: std::cell::RefCell<Option<slint::Weak<crate::PanelWindow>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 把 settings 主题应用到面板窗口（设置窗口主题键变更时调用；无面板时静默跳过）。
+pub fn apply_panel_theme(settings: &Value) {
+    PANEL_WINDOW.with(|slot| {
+        if let Some(panel) = slot.borrow().as_ref().and_then(|w| w.upgrade()) {
+            window_state::apply_theme(&panel, settings);
+        }
+    });
+}
+
+/// 面板静态文案重载（语言切换时调用；equiv getLocalization 后的窗口重渲染）。
+pub fn apply_panel_texts() {
+    PANEL_WINDOW.with(|slot| {
+        if let Some(panel) = slot.borrow().as_ref().and_then(|w| w.upgrade()) {
+            apply_static_texts(&panel);
+        }
+    });
 }
 
 /// HUD 快照展示(取当前平均亮度,等价 hotkeyOverlayStart 的覆盖层)。
@@ -388,6 +415,9 @@ pub fn run_panel_controller(
 ) -> Result<(), String> {
     let panel = crate::PanelWindow::new().map_err(|e| e.to_string())?;
     let weak = panel.as_weak();
+    PANEL_WINDOW.with(|slot| {
+        *slot.borrow_mut() = Some(panel.as_weak());
+    });
 
     let initial_settings = settings.lock().map(|g| g.clone()).unwrap_or(json!({}));
     let state = Rc::new(RefCell::new(PanelState {

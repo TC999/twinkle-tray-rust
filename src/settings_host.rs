@@ -214,11 +214,44 @@ fn wire_callbacks(
     ui.on_item_choice(move |key, value| {
         let Some(ui) = weak.upgrade() else { return };
         let key = key.to_string();
+        // ComboBox selected 回调传显示文本：按 items 模型映射回选项值
+        // （等价 <select> 的 e.target.value；数值/文本输入项无选项表，原样透传）
+        let value = resolve_choice_label(&ui, &key, &value.to_string());
         let parsed: Value = match value.parse::<f64>() {
             Ok(n) if is_numeric_key(&key) => json!(n as i64),
-            _ => json!(value.to_string()),
+            _ => json!(value),
         };
-        let updated = update_setting(&snap, &key, parsed);
+        let mut updated = update_setting(&snap, &key, parsed);
+
+        // windowsStyle -> isWin11 映射（equiv L1345-L1355）
+        if key == "windowsStyle" {
+            let style = updated
+                .get("windowsStyle")
+                .and_then(|v| v.as_str())
+                .unwrap_or("system");
+            let is_win11 = match style {
+                "win11" => true,
+                "win10" => false,
+                _ => monitor_thread_manager::is_windows_11(),
+            };
+            updated = update_setting(&snap, "isWin11", json!(is_win11));
+        }
+
+        // 语言切换（equiv L1277-L1280：getLocalization() + rebuildTray = true）：
+        // 重载 FTL 语料 -> 重建侧边栏页名/窗口文案/面板文案 -> 重建托盘菜单文案
+        if key == "language" {
+            reload_language(&updated);
+            ui.set_pages(settings_view::model(settings_view::build_pages()));
+            apply_texts(&ui);
+            crate::panel_controller::apply_panel_texts();
+            rebuild_tray_menu();
+        }
+
+        // theme-settings 全窗口广播（equiv L1252-L1254：settings.theme 恒真，
+        // 每次 processSettings 都发；windowsStyle 改 isWin11 后同样由此生效）
+        window_state::apply_settings_theme(&ui, &updated);
+        crate::panel_controller::apply_panel_theme(&updated);
+
         apply_side_effects(&worker, &key, &updated);
         // udpEnabled 开关（equiv L1326-L1330）：true 启动 / false 停止
         if key == "udpEnabled" {
@@ -495,9 +528,70 @@ fn apply_side_effects(host: &Arc<crate::monitor_host::MonitorHost>, key: &str, s
     }
 }
 
+/// 托盘菜单重建钩子（menu 构建函数在 bin 侧 main.rs，lib 经此间接调用）。
+static TRAY_MENU_REBUILDER: std::sync::Mutex<Option<fn() -> Vec<tray::TrayMenuItem>>> =
+    std::sync::Mutex::new(None);
+
+/// 注册托盘菜单重建函数（main.rs 启动时调用一次）。
+pub fn set_tray_menu_rebuilder(f: fn() -> Vec<tray::TrayMenuItem>) {
+    if let Ok(mut slot) = TRAY_MENU_REBUILDER.lock() {
+        *slot = Some(f);
+    }
+}
+
+/// 重建托盘菜单文案（equiv rebuildTray 的菜单部分：图标不重建）。
+/// 菜单结构键（has_tod/idle_enabled/profiles/isDev）读 settings 文件快照，
+/// 与语言无关；文案经 tt_localize 当前语言表即时生效。
+fn rebuild_tray_menu() {
+    let f = TRAY_MENU_REBUILDER.lock().ok().and_then(|g| *g);
+    if let Some(f) = f {
+        tray::update_tray_menu(f());
+    }
+}
+
+/// 语言设置生效（equiv electron.js getLocalization L2241-L2291 的 desired 装载）：
+/// "system" 按系统 locale 检测，否则按设置值；缺语料回退 en。
+fn reload_language(settings: &Value) {
+    let language = settings
+        .get("language")
+        .and_then(|v| v.as_str())
+        .unwrap_or("system");
+    let code = if language == "system" {
+        tt_localize::detect_language_code(&window_state::system_locale())
+    } else {
+        language.to_string()
+    };
+    if tt_localize::language_source(&code).is_some() {
+        tt_localize::set_language(&code);
+    } else {
+        tt_localize::set_language("en");
+    }
+}
+
+/// 下拉显示文本 -> 选项值（equiv <select> 的 e.target.value）。
+/// 在当前 items 模型里找同键且有选项表的项，按 labels 位置取 values；
+/// 无匹配（数值/文本输入项原样透传，或未知文本）时返回原文。
+fn resolve_choice_label(ui: &crate::SettingsWindow, key: &str, label: &str) -> String {
+    use slint::Model;
+    let items = ui.get_items();
+    for i in 0..items.row_count() {
+        let Some(item) = items.row_data(i) else { continue };
+        if item.key.as_str() != key || item.option_values.row_count() == 0 {
+            continue;
+        }
+        for j in 0..item.option_labels.row_count() {
+            if item.option_labels.row_data(j).as_deref() == Some(label) {
+                if let Some(v) = item.option_values.row_data(j) {
+                    return v.to_string();
+                }
+            }
+        }
+    }
+    label.to_string()
+}
+
 /// 数值型设置键（equiv 原版的 target.value * 1 语义）。
-fn is_numeric_key(key: &str) -> bool {
-    matches!(
+fn is_numeric_key(key: &str) -> bool {    matches!(
         key,
         "updateInterval"
             | "ddcPowerOffValue"

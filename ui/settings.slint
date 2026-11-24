@@ -4,7 +4,7 @@
 // 内容由 Rust 侧按原版页面顺序构建成 SettingsItem 列表注入（数据驱动），
 // 每个开关/下拉/按钮都与 SettingsWindow.jsx 的设置项一一对应。
 import { Theme } from "theme.slint";
-import { LineEdit, ScrollView } from "std-widgets.slint";
+import { ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
 
 export enum SettingsItemKind {
     toggle,
@@ -16,11 +16,6 @@ export enum SettingsItemKind {
     section,
 }
 
-export struct SettingsChoice {
-    value: string,
-    label: string,
-}
-
 export struct SettingsItem {
     kind: SettingsItemKind,
     key: string,
@@ -28,11 +23,12 @@ export struct SettingsItem {
     description: string,
     toggle-value: bool,
     text-value: string,
-    options: [SettingsChoice],
-    // 当前选中项的显示文本（Rust 侧按 text-value 查 options 得出，Slint 函数不支持遍历 model）
-    selected-label: string,
-    // 点击下拉后应切到的下一个值（equiv <select> 轮换语义，由 Rust 侧计算）
-    next-value: string,
+    // 下拉选项：values 与 labels 同序一一对应（selected 回调只给显示文本，
+    // Rust 侧按 labels 位置映射回 values，等价原版 <select> 的 value/option 对）
+    option-values: [string],
+    option-labels: [string],
+    // 当前选中项下标（Rust 侧按 text-value 在 option-values 中查得；未知值回落 0）
+    selected-index: int,
     button-label: string,
     disabled: bool,
 }
@@ -242,25 +238,14 @@ component SettingsRow inherits Rectangle {
                 enabled: !root.item.disabled;
                 toggled(v) => { root.toggle-changed(v); }
             }
-            if (root.item.kind == SettingsItemKind.select) : Rectangle {
-                width: 150px;
-                height: 26px;
-                border-radius: 4px;
-                background: Theme.button-bg;
-                border-width: 1px;
-                border-color: Theme.button-border;
-                Text {
-                    text: root.item.selected-label;
-                    font-size: 12px;
-                    color: Theme.text;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                    overflow: elide;
-                }
-                TouchArea {
-                    enabled: !root.item.disabled;
-                    clicked => { root.choice-picked(root.item.next-value); }
-                }
+            // 下拉（equiv <select>）：真实 ComboBox，选项来自 option-labels，
+            // 选中项由 selected-index 绑定；selected 回调传显示文本，Rust 侧映射回选项值
+            if (root.item.kind == SettingsItemKind.select) : ComboBox {
+                width: 160px;
+                enabled: !root.item.disabled;
+                model: root.item.option-labels;
+                current-index: root.item.selected-index;
+                selected(label) => { root.choice-picked(label); }
             }
             if (root.item.kind == SettingsItemKind.button) : Rectangle {
                 width: Math.max(80px, bl.preferred-width + 24px);

@@ -270,6 +270,8 @@ fn main() {
 
     // 托盘图标（equiv createTray：图标随主题切换，§1.2 禁止自绘）
     let (_tray_handle, tray_events) = start_tray(&settings, &exe_dir);
+    // 注册托盘菜单重建函数：设置页切换语言后重建菜单文案（equiv rebuildTray）
+    twinkle_tray_rust::settings_host::set_tray_menu_rebuilder(build_tray_menu);
 
     // 运行时状态机（equiv electron.js 的模块级状态集合）
     let runtime = twinkle_tray_rust::runtime_hosts::RuntimeHost::new(
@@ -316,7 +318,7 @@ fn init_localization(settings: &serde_json::Value) {
         .and_then(|v| v.as_str())
         .unwrap_or("system");
     let code = if language == "system" {
-        tt_localize::detect_language_code(&system_locale())
+        tt_localize::detect_language_code(&twinkle_tray_rust::window_state::system_locale())
     } else {
         language.to_string()
     };
@@ -327,21 +329,6 @@ fn init_localization(settings: &serde_json::Value) {
         tt_localize::set_language("en");
     }
     logger::log_as("MAIN", "info", &format!("Localization loaded: {}", code));
-}
-
-/// 系统 locale（equiv app.getLocale()）。
-fn system_locale() -> String {
-    use windows::Win32::Globalization::{GetUserDefaultLocaleName, MAX_LOCALE_NAME};
-    // SAFETY: 缓冲区为固定长度的可写数组，API 只写入至多 MAX_LOCALE_NAME 个宽字符。
-    unsafe {
-        let mut buf = [0u16; MAX_LOCALE_NAME as usize];
-        let len = GetUserDefaultLocaleName(&mut buf);
-        if len > 0 {
-            let end = buf.iter().position(|c| *c == 0).unwrap_or(len as usize);
-            return String::from_utf16_lossy(&buf[..end]);
-        }
-    }
-    "en-US".to_string()
 }
 
 /// 托盘图标（equiv createTray + getTrayIconPath）。

@@ -374,7 +374,8 @@ fn upgrade_hotkeys(settings: &mut Value) {
 }
 
 /// isWin11 检测（equiv electron.js:L97 isReallyWin11）。
-fn is_windows_11() -> bool {
+/// 公开供 settings_host 的 windowsStyle -> isWin11 映射（equiv L1345-L1355）复用。
+pub fn is_windows_11() -> bool {
     // os.release() 第三段 >= 22000
     if let Ok(output) = std::process::Command::new("cmd").args(["/c", "ver"]).output() {
         let text = String::from_utf8_lossy(&output.stdout);

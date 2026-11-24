@@ -130,6 +130,22 @@ pub fn system_uses_dark_mode() -> bool {
     }
 }
 
+/// 系统 locale（equiv app.getLocale()）。
+/// 主进程启动装载与设置页语言切换共用（equiv getLocalization L2242-L2253 的检测输入）。
+pub fn system_locale() -> String {
+    use windows::Win32::Globalization::{GetUserDefaultLocaleName, MAX_LOCALE_NAME};
+    // SAFETY: 缓冲区为固定长度的可写数组，API 只写入至多 MAX_LOCALE_NAME 个宽字符。
+    unsafe {
+        let mut buf = [0u16; MAX_LOCALE_NAME as usize];
+        let len = GetUserDefaultLocaleName(&mut buf);
+        if len > 0 {
+            let end = buf.iter().position(|c| *c == 0).unwrap_or(len as usize);
+            return String::from_utf16_lossy(&buf[..end]);
+        }
+    }
+    "en-US".to_string()
+}
+
 /// "#RRGGBB" / "#AARRGGBB" -> Slint 颜色。
 pub fn parse_color(text: &str) -> Option<slint::Color> {
     let hex = text.trim_start_matches('#');

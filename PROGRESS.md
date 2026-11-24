@@ -563,3 +563,51 @@ PostMessage(TwinkleTrayTrayClass, WM_TRAY_ICON/WM_LBUTTONUP)
 - 面板/设置窗口的关闭采用 `hide()` 而非销毁（Slint 无等价 Electron `window.close()`），沿用 Round 8 记录。
 - 设置页重排（拖拽）降级为上下移按钮（Slint 无拖拽列表），语义等价。
 - `SETTINGS_MONITORS_GAMMA_SLIDER_TITLE` 在 zh-Hans.ftl 缺失 → 回退 en（源 zh-Hans.json 同样缺该键，属本地化数据差异）。
+
+## Round 12 · 2026-11-24：设置页下拉框改 ComboBox + 语言/主题/UI 样式生效
+
+### 症状
+
+通用设置页的「语言」「主题」「Windows UI 样式」三项是"点一次轮换到下一项"的伪下拉，
+且切换后**不生效**：语言不变、主题不重着色、Win11/Win10 样式不切换。
+
+### 根因
+
+| # | 缺陷 | 位置 | 后果 |
+|---|---|---|---|
+| 1 | select 项渲染为 click-to-cycle 按钮（Slint 早期无下拉方案时的过渡实现） | `ui/settings.slint` | 交互与原版 `<select>` 不符 |
+| 2 | `item_choice` 只写 settings，无任何外观/语言副作用 | `settings_host.rs` | 语言：`tt_localize` 永不重载 → 不生效；主题：仅靠 monitors 轮询顺带刷新；windowsStyle：`isWin11` 从未映射 → 恒为启动值 |
+
+### 修复
+
+1. **真实下拉**（`ui/settings.slint` + `settings_view.rs`）：select 项改 `std-widgets ComboBox`
+   （fluent 样式，等价原版 `<select>`）。`SettingsItem` 以同序 `option-values`/`option-labels`
+   + `selected-index` 替代 `selected-label`/`next-value`/`options([SettingsChoice])`（结构体删除）。
+   ComboBox 的 `selected` 回调只传显示文本，Rust 侧 `resolve_choice_label` 按当前 items 模型
+   按 labels 位置映射回 values（等价 `e.target.value`；数值/文本输入项无选项表，原样透传）。
+   此改动对全部下拉项生效（updateInterval/sleepAction/preferredDDCCIMethod 等同步受益）。
+2. **windowsStyle → isWin11**（`settings_host.rs`，equiv electron.js:L1345-L1355）：
+   `win11→true / win10→false / system→真实检测`（`monitor-thread-manager::is_windows_11` 转公开）。
+3. **语言切换**（`settings_host.rs reload_language`，equiv L1277-L1280 getLocalization + rebuildTray）：
+   重载 FTL 语料（system → `window_state::system_locale()` 检测，检测函数自 main.rs 移入 lib）→
+   重建侧边栏页名 + 设置窗口文案 + 面板文案（`panel_controller::apply_panel_texts`，
+   新增 PANEL_WINDOW 主线程 Weak 槽位）→ 托盘菜单重建
+   （`tray::update_tray_menu` 仅替换菜单快照，图标不重建；main.rs 经
+   `settings_host::set_tray_menu_rebuilder` 注册钩子）。
+4. **主题广播**（equiv L1252-L1254：settings.theme 恒真，每次 processSettings 都发）：
+   `item_choice` 路径统一调 `apply_settings_theme`（设置窗口）+ `apply_panel_theme`（面板），
+   windowsStyle 写回 isWin11 后由同一广播生效。
+
+### 已知差异（记录，不阻塞）
+
+- `selected` 回调选中后内部赋值会覆盖 `current-index` 外部绑定，此后同页项的外部重建
+  （如 reset-settings）不再回写选中下标，依赖 ComboBox 的 `changed model` 自校正；
+  正常"选择 → 写回 → 重建"链路显示始终正确。
+- 托盘菜单结构键（has_tod/profiles/isDev）读 settings 文件快照（333ms 防抖落盘），
+  与语言无关；文案经 tt_localize 即时生效。
+
+### 回归测试
+
+`cargo test --workspace` 全绿：新增 `select_resolves_current_index`、
+`select_items_carry_aligned_options`；其余 54+ 用例（含 settings_view/settings_host 全部）
+0 失败。`cargo build --workspace` 零错误。

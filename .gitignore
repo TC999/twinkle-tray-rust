@@ -34,3 +34,6 @@ crates/*/Cargo.lock
 
 # AI 助手的工作区记忆（本地数据，不入库）
 .workbuddy/
+
+# 运行时生成的设置文件
+settings.json

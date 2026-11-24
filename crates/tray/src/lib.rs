@@ -10,6 +10,6 @@ pub mod tray_icon;
 pub use hotkey::{register_hotkey, unregister_hotkey, HotkeyReceiver};
 pub use tray_icon::{
     create_tray_icon, remove_tray_icon, run_message_loop, set_tray_callback, spawn_tray_thread,
-    stop_tray_thread, tray_window_handle, update_tray_icon, TrayConfig, TrayEvent, TrayIconHandle,
-    TrayMenuItem,
+    stop_tray_thread, tray_window_handle, update_tray_icon, update_tray_menu, TrayConfig,
+    TrayEvent, TrayIconHandle, TrayMenuItem,
 };

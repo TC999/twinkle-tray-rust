@@ -222,6 +222,19 @@ pub fn remove_tray_icon(handle: &TrayIconHandle) {
     }
 }
 
+/// 重建托盘菜单表（equiv electron 的 rebuildTray 菜单部分）。
+/// 图标不重建，仅替换 show_menu 读取的菜单快照：语言切换等场景下，
+/// 下一次右键弹出即使用新文案（菜单每次弹出都是现读现建 HMENU）。
+pub fn update_tray_menu(items: Vec<TrayMenuItem>) -> bool {
+    match menu_slot().lock() {
+        Ok(mut menu) => {
+            *menu = items;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// 递归追加菜单项到 HMENU（equiv Menu.buildFromTemplate 的 submenu 展开）。
 /// 非空 children 的项以 MF_POPUP 追加子菜单；点击子菜单项时 TrackPopupMenu
 /// 返回其 id（等价 electron submenu 项的 click 回调）。

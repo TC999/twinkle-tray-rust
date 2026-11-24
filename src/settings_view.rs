@@ -81,6 +81,8 @@ impl ItemBuilder {
     }
 
     /// 下拉（equiv <select>）：options 为 (value, label) 列表。
+    /// ComboBox 的 model 只接受字符串，故拆成同序的 values/labels 两个数组；
+    /// selected 回调传显示文本，宿主侧按 labels 位置映射回 values。
     fn select(
         &mut self,
         key: &str,
@@ -93,7 +95,8 @@ impl ItemBuilder {
             .get(key)
             .map(json_to_string)
             .unwrap_or_default();
-        let (selected_label, next_value) = compute_selection(&current, options);
+        let values: Vec<&str> = options.iter().map(|(v, _)| *v).collect();
+        let selected_index = compute_selection_index(&current, &values);
         self.items.push(SettingsItem {
             kind: SettingsItemKind::Select,
             key: key.into(),
@@ -104,15 +107,14 @@ impl ItemBuilder {
                 tt_localize::t(desc_key).into()
             },
             text_value: current.into(),
-            selected_label: selected_label.into(),
-            next_value: next_value.into(),
-            options: ModelRc::new(VecModel::from(
+            selected_index: selected_index as i32,
+            option_values: ModelRc::new(VecModel::from(
+                values.iter().map(|v| (*v).into()).collect::<Vec<_>>(),
+            )),
+            option_labels: ModelRc::new(VecModel::from(
                 options
                     .iter()
-                    .map(|(v, l)| SettingsChoice {
-                        value: (*v).into(),
-                        label: l.as_str().into(),
-                    })
+                    .map(|(_, l)| l.as_str().into())
                     .collect::<Vec<_>>(),
             )),
             ..Default::default()
@@ -184,18 +186,10 @@ fn json_to_string(v: &Value) -> String {
     }
 }
 
-/// 下拉轮换：(当前显示文本, 下一个值)。等价 <select> 的"点一次换下一个"语义。
-fn compute_selection(current: &str, options: &[(&str, String)]) -> (String, String) {
-    if options.is_empty() {
-        return (current.to_string(), String::new());
-    }
-    let idx = options
-        .iter()
-        .position(|(v, _)| *v == current)
-        .unwrap_or(0);
-    let label = options[idx].1.clone();
-    let next = options[(idx + 1) % options.len()].0;
-    (label, next.to_string())
+/// 下拉选中下标：当前值在选项值中的位置；未知值回落第一项（equiv <select>
+/// 无匹配 option 时浏览器保持/回落首项的表现）。
+fn compute_selection_index(current: &str, values: &[&str]) -> usize {
+    values.iter().position(|v| *v == current).unwrap_or(0)
 }
 
 /// 构建某一页的设置项列表。
@@ -894,6 +888,7 @@ pub fn model<T: Clone + 'static>(items: Vec<T>) -> ModelRc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slint::Model;
 
     #[test]
     fn pages_match_origin_sidebar() {
@@ -906,22 +901,18 @@ mod tests {
     }
 
     #[test]
-    fn select_cycles_to_next_value() {
-        let options = vec![
-            ("default", "System".to_string()),
-            ("dark", "Dark".to_string()),
-            ("light", "Light".to_string()),
-        ];
-        assert_eq!(compute_selection("dark", &options), ("Dark".to_string(), "light".to_string()));
+    fn select_resolves_current_index() {
+        let values = vec!["default", "dark", "light"];
+        assert_eq!(compute_selection_index("dark", &values), 1);
         // 未知值 -> 从第一个开始
-        assert_eq!(compute_selection("zzz", &options), ("System".to_string(), "dark".to_string()));
-        // 末尾回环
-        assert_eq!(compute_selection("light", &options), ("Light".to_string(), "default".to_string()));
+        assert_eq!(compute_selection_index("zzz", &values), 0);
+        assert_eq!(compute_selection_index("light", &values), 2);
+        // 空选项不 panic
+        assert_eq!(compute_selection_index("dark", &[]), 0);
     }
 
     #[test]
-    fn general_page_covers_key_settings() {
-        let settings = json!({"openAtLogin": true, "theme": "dark", "useAcrylic": false});
+    fn general_page_covers_key_settings() {        let settings = json!({"openAtLogin": true, "theme": "dark", "useAcrylic": false});
         let items = build_items("general", &settings);
         let keys: Vec<&str> = items
             .iter()
@@ -956,6 +947,19 @@ mod tests {
         // 开关值来自 settings
         let toggle = items.iter().find(|i| i.key == "openAtLogin").unwrap();
         assert!(toggle.toggle_value);
+    }
+
+    #[test]
+    fn select_items_carry_aligned_options() {
+        // 下拉项：values/labels 同序等长，selected-index 指向当前值
+        let settings = json!({"theme": "dark", "language": "en"});
+        let items = build_items("general", &settings);
+        let theme = items.iter().find(|i| i.key == "theme").unwrap();
+        assert_eq!(theme.option_values.row_count(), theme.option_labels.row_count());
+        assert_eq!(theme.selected_index, 1);
+        assert_eq!(theme.option_values.row_data(1).as_deref(), Some("dark"));
+        let lang = items.iter().find(|i| i.key == "language").unwrap();
+        assert_eq!(lang.option_values.row_data(1).as_deref(), Some("en"));
     }
 
     #[test]

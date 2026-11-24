@@ -2,6 +2,6 @@
 
 pub use crate::{
     DisplayType, FeatureKind, PanelFeature, PanelInput, PanelMonitor, SettingsCalibrationPoint,
-    SettingsChoice, SettingsHotkey, SettingsItem, SettingsItemKind, SettingsMonitorEntry,
+    SettingsHotkey, SettingsItem, SettingsItemKind, SettingsMonitorEntry,
     SettingsPage,
 };
