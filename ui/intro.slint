@@ -3,6 +3,9 @@
 import { Theme } from "theme.slint";
 
 export component IntroWindow inherits Window {
+    // 窗口图标（equiv BrowserWindow.icon = logo.ico）。
+    icon: @image-url("../assets/logo-square.png");
+
     in-out property <string> t-title: "Hello, Twinkle Tray!";
     in-out property <string> t-instructions: "";
     in-out property <string> t-close: "Close";

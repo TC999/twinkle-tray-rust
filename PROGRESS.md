@@ -807,3 +807,61 @@ cargo test --workspace 全绿（0 失败）；cargo build 零错误
   才会出现在 include_modules 的 Rust API 里。
 - Rust 侧 `ColorScheme` 枚举未在 slint 顶层公开，位于
   `slint::private_unstable_api::re_exports::ColorScheme`（Unknown/Dark/Light）。
+
+## Round 20 · 2026-11-25：程序图标（exe 资源嵌入 + 窗口图标）
+
+### 目标
+
+等价原版 electron-builder 的图标语义（origin/package.json build.win.icon = src/assets/logo.ico）：
+exe 文件图标 + 文件元数据（VERSIONINFO）+ 各窗口（BrowserWindow.icon）标题栏/任务栏图标。
+
+### 实现
+
+| 部分 | 文件 | 要点 |
+|---|---|---|
+| exe 图标 + VERSIONINFO | `build.rs` | 动态生成资源脚本（版本号取 CARGO_PKG_VERSION，避免双源；纯 ASCII，图标路径相对 manifest 目录、rc.exe 以 manifest_dir 为 cwd 编译）→ SDK rc.exe 编译 .res → cvtres 转 COFF .obj → `cargo:rustc-link-arg-bins` 直接作为最终二进制链接输入。rc.exe/cvtres 缺失或失败时 `cargo:warning` 降级跳过，不阻塞构建 |
+| 窗口图标 | `ui/{panel,settings,intro,hud}.slint` | Slint `Window.icon` 原生属性：`icon: @image-url("../assets/logo-square.png")`（编译期嵌入，无运行时资产依赖）。winit 后端在窗口创建/update_window_properties 时经 winit `set_window_icon` + Windows `set_taskbar_icon` 原生设置 |
+
+### 踩坑记录（关键）
+
+1. **`.res` 复制为 `.lib` 链接无效**：cargo 报 `Unsupported archive identifier`（.res 是资源表
+   格式不是 COFF 档案）。正确链路是 cvtres 转 COFF obj。
+2. **`rustc-link-lib=static` 拉入 COFF 档案也不行**：无符号引用的档案成员不被拉入（资源 obj
+   无任何符号），图标不进 exe。必须 `cargo:rustc-link-arg-bins` 显式传给最终链接——显式 obj
+   输入不走档案成员拉取规则，`.rsrc` 段必然合并。
+3. **cvtres 绝对路径参数不可靠**：工程路径含非 ASCII 字符（G:\杂项\...）时 cvtres 在 ANSI
+   代码页下无法打开目标文件（CVT1101）。让 cvtres 以 out_dir 为 cwd、用 ASCII 相对文件名工作。
+4. **窗口图标放弃手写 WM_SETICON**：winit 后端的 raw-window-handle 实现
+   （`window_handle_06_rc` → `winit_window_or_none.as_window()`）在窗口 show 且事件循环
+   未跑起来前返回 `HandleError`，show 后 200ms 重试仍拿不到（winit 延迟创建窗口）。
+   Slint `Window.icon` 属性是官方入口：窗口创建时即注入 winit `window_icon`，任务栏图标
+   同步设置（`set_taskbar_icon`），无需自己碰 Win32。
+5. rc.exe 对无 BOM 文件按**活动代码页**解码——资源脚本保持纯 ASCII（中文注释会乱码损坏）。
+
+### 真机对拍（2026-11-25）
+
+```
+# exe 资源
+[System.Drawing.Icon]::ExtractAssociatedIcon(exe) → 32x32 关联图标可用
+(Get-Item exe).VersionInfo → desc=Twinkle Tray / prod=Twinkle Tray / ver=0.1.0 / company=Xander Frangos / trademark=Xander Frangos
+exe 尺寸增长 ≈ +330KB（logo.ico 9 档嵌入），FileDescription/Twinkle Tray 的 UTF-16LE 串在 exe 中命中
+
+# 窗口图标（--ui-demo 真机，EnumWindows + WM_GETICON(0x7F) 查询）
+'调整亮度'      ICON_SMALL=0x1E00A63  ✅ 非零
+'Twinkle Tray 设置' ICON_SMALL=0x9E10B31  ✅ 非零
+（修复前两窗口恒 0x0；任务栏/Alt-Tab 显示 Twinkle Tray 图标）
+
+# 回归
+cargo build --workspace：零错误零警告（增量检查 clean）
+cargo test --workspace：全部通过
+```
+
+### 等价性说明
+
+- exe 图标/元数据：与 electron-builder 产物等价（同一 logo.ico 资源 + 同名字段 FileDescription/
+  ProductName/CompanyName/LegalTrademarks，版本号同源 Cargo.toml ↔ package.json）。
+- 窗口图标：原版每个 BrowserWindow 继承 build.win.icon；Rust 侧四窗口统一声明同一 PNG 资产
+  （同一 logo 的 512px 方形版，ico 内 9 档位图由 winit/Slint 自行取档）。行为语义一致：
+  窗口标题栏 + 任务栏 + Alt-Tab 均显示应用图标。
+- 资源编译失败仅降级为「无图标 exe」（外观缺失），不影响任何功能路径（§5 出错降级不崩溃）。
+

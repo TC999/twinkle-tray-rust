@@ -339,6 +339,9 @@ component SettingsItems inherits VerticalLayout {
 }
 
 export component SettingsWindow inherits Window {
+    // 窗口图标（equiv BrowserWindow.icon = logo.ico）。
+    icon: @image-url("../assets/logo-square.png");
+
     // ---- 数据（Rust 侧注入）----
     in-out property <[SettingsPage]> pages: [];
     in-out property <[SettingsItem]> items: [];

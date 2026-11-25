@@ -505,6 +505,10 @@ component UpdateBar inherits Rectangle {
 }
 
 export component PanelWindow inherits Window {
+    // 窗口图标（equiv BrowserWindow.icon = logo.ico；winit 后端创建窗口时原生设置
+    // 并同步任务栏图标，见 i-slint-backend-winit update_window_properties）。
+    icon: @image-url("../assets/logo-square.png");
+
     // ---- 数据（Rust 侧 model 注入）----
     in-out property <[PanelMonitor]> monitors: [];
     in-out property <int> visible-count: 0;
