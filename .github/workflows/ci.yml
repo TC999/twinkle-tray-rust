@@ -41,8 +41,21 @@ jobs:
     - name: Build
       run: cargo build --release --locked
 
+    # 打包可分发布局：exe 旁必须带 assets/tray-icons（运行时按 exe 目录搜索链
+    # 加载托盘图标，见 src/main.rs start_tray；只上传裸 exe 会因找不到图标
+    # 直接跳过托盘创建——无托盘即无法打开面板，程序等于不可用）。
+    - name: Package
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path dist | Out-Null
+        Copy-Item target/release/twinkle-tray-rust.exe dist/
+        New-Item -ItemType Directory -Path dist/assets | Out-Null
+        Copy-Item -Recurse assets/tray-icons dist/assets/tray-icons
+        Copy-Item LICENSE dist/
+        Compress-Archive -Path dist/* -DestinationPath twinkle-tray-rust-x64.zip -Force
+
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v7.0.0
       with:
         name: twinkle-tray-rust-x64
-        path: target/release/*.exe
+        path: twinkle-tray-rust-x64.zip
