@@ -2,7 +2,8 @@
 //!
 //! equiv: electron-builder build.win.icon = src/assets/logo.ico —— 原版构建把
 //! logo.ico 嵌为 exe 图标与文件元数据（origin/package.json build.win.icon）。
-//! 这里用 SDK rc.exe 编译动态生成的资源脚本，以 COFF 静态库形式链接进 exe。
+//! 这里用 SDK rc.exe 编译动态生成的资源脚本，产出的 .res 直接作为链接输入
+//! （MSVC link.exe 原生接受 .res 资源文件输入，会合并进 exe 的 .rsrc 段）。
 //! rc.exe 缺失或编译失败时打印 cargo:warning 并跳过（资源只影响外观，
 //! 不阻塞构建——符合"出错则降级，不是崩溃"的移植规范）。
 
@@ -19,6 +20,11 @@ fn build_windows_resources() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    // 资源脚本唯一的外部输入是图标文件，必须显式声明依赖：
+    // slint-build 会打印自己那批 rerun-if-changed（ui/*.slint + assets/logo.png），
+    // 而 cargo 一旦收到任何 rerun-if-changed 就只跟踪这批路径——不补这一行，
+    // 改 assets/logo.ico 后 build script 不会重跑，exe 里嵌的仍是旧图标。
+    println!("cargo:rerun-if-changed=assets/logo.ico");
     let Some(rc_exe) = find_rc_exe() else {
         println!("cargo:warning=rc.exe not found; exe icon/version resources skipped");
         return;
@@ -29,6 +35,9 @@ fn build_windows_resources() {
 
     // 资源脚本保持纯 ASCII（rc.exe 以活动代码页解码无 BOM 文件）；图标路径相对
     // manifest 目录，编译时 cwd=manifest_dir。版本号取自 Cargo.toml，避免双源。
+    // 资源用**数字 id**（1 ICON / 1 VERSIONINFO）而非字符串名：rc.exe 默认生成
+    // ANSI 资源名，只有带 BOM 的 .rc 才生成 Unicode 名，字符串名在运行期要用
+    // MAKEINTRESOURCEA 命中、极易踩坑；数字 id 用 MAKEINTRESOURCEW(1) 无歧义。
     let (major, minor, patch) = match version.split('.').collect::<Vec<_>>()[..] {
         [a, b, c] => (a.to_string(), b.to_string(), c.to_string()),
         _ => ("0".into(), "1".into(), "0".into()),
@@ -48,34 +57,13 @@ fn build_windows_resources() {
         .status();
     match status {
         Ok(s) if s.success() && res_file.exists() => {
-            // .res 是资源表格式而非 COFF 档案，rustc 的 native lib 解析不接受。
-            // 链路：rc.exe -> .res -> cvtres 转 COFF .obj -> 直接作为链接输入。
-            let Some(cvtres) = find_msvc_bin("cvtres.exe") else {
-                println!("cargo:warning=cvtres.exe not found; exe icon/version resources skipped");
-                return;
-            };
-            // cvtres 在 out_dir 内以 ASCII 相对文件名工作（工程路径含非 ASCII
-            // 字符时绝对路径参数在工具链 ANSI 代码页下不可靠）。
-            let obj_file = out_dir.join("app.res.obj");
-            let cvtres_status = Command::new(&cvtres)
-                .current_dir(&out_dir)
-                .args(["/MACHINE:X64", "/NOLOGO"])
-                .arg("/OUT:app.res.obj")
-                .arg("app.res")
-                .status();
-            match cvtres_status {
-                Ok(s2) if s2.success() && obj_file.exists() => {
-                    // 直接把 COFF obj 传给最终二进制链接：显式 obj 输入不走档案成员
-                    // 拉取规则（无符号引用也会链接），.rsrc 段必然合并进 exe。
-                    // （此前 .res 复制为 .lib 的做法失败：无符号档案成员不被拉入。）
-                    println!("cargo:rustc-link-arg-bins={}", obj_file.display());
-                }
-                Ok(s2) => println!(
-                    "cargo:warning=cvtres failed (exit {:?}); exe icon/version resources skipped",
-                    s2.code()
-                ),
-                Err(e) => println!("cargo:warning=cvtres spawn failed: {e}; resources skipped"),
-            }
+            // .res 直接作为链接输入（equiv embed-resource crate 的 MSVC 路径）：
+            // link.exe 原生接受 .res 资源文件输入，显式 obj/文件输入不走档案成员
+            // 拉取规则，.rsrc 段必然合并进 exe。
+            // （此前"先转 COFF .obj 再链接"的链路已删除：cvtres 是 ANSI 工具，
+            //  工程路径含非 ASCII 字符时无法打开目标文件报 CVT1101；.res 直连
+            //  由 link.exe 处理，不存在该问题，也不再需要硬编码 MSVC 安装路径。）
+            println!("cargo:rustc-link-arg-bins={}", res_file.display());
         }
         Ok(s) => println!(
             "cargo:warning=rc.exe failed (exit {:?}); exe icon/version resources skipped",
@@ -83,33 +71,6 @@ fn build_windows_resources() {
         ),
         Err(e) => println!("cargo:warning=rc.exe spawn failed: {e}; resources skipped"),
     }
-}
-
-/// 定位 MSVC 工具（cvtres.exe/lib.exe）：VCToolsInstallDir 优先，
-/// 其次仓库既定的本机 MSVC 安装位置（tools/build-env.cmd 同源）。
-fn find_msvc_bin(exe: &str) -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("VCToolsInstallDir") {
-        let p = PathBuf::from(dir).join("bin").join("Hostx64").join("x64").join(exe);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(root) = std::env::var("MSVC") {
-        let p = PathBuf::from(root).join("bin").join("Hostx64").join("x64").join(exe);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    // tools/build-env.cmd 的固定安装位置（本仓库既定构建环境）。
-    let p = PathBuf::from(r"D:\Software\Visual Studio\VC\Tools\MSVC\14.41.34120")
-        .join("bin")
-        .join("Hostx64")
-        .join("x64")
-        .join(exe);
-    if p.exists() {
-        return Some(p);
-    }
-    None
 }
 
 /// 定位 Windows SDK rc.exe：优先 SDK 环境变量，其次枚举默认安装位置取最新版本。

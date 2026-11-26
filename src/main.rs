@@ -380,27 +380,42 @@ fn start_tray(
         "dark"
     };
     let file = format!("{}.ico", icon_name);
-    // 图标资产搜索链（AGENTS.md §1.2：加载预生成 ico，禁止自绘）：
-    // 1) exe 目录旁 assets/tray-icons（发布布局：assets 随 exe 部署）
-    // 2) exe 目录旁的 origin/src/assets（dev 运行 target/debug 时 exe_dir 是 target/debug）
-    // 3) 仓库根 origin/src/assets（exe_dir 向上回溯两级）
-    // 4) 当前工作目录的 origin/src/assets（任意 cwd 启动兜底）
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    candidates.push(exe_dir.join("assets").join("tray-icons").join(&dir).join(&file));
-    candidates.push(exe_dir.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
-    if let Some(parent) = exe_dir.parent() {
-        candidates.push(parent.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
-    }
-    if let Some(grand) = exe_dir.parent().and_then(|p| p.parent()) {
-        candidates.push(grand.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
+    // 图标资产搜索链（AGENTS.md §1.2：加载预生成 ico，禁止自绘）。
+    // 基点：exe 目录及其上溯三级（覆盖 dev 布局 target/debug → 仓库根、
+    // 打包布局 dist/ → 仓库根），再加当前工作目录（任意 cwd 启动兜底）。
+    // 每级基点优先找规范副本 assets/tray-icons（已入库，发布时随 exe 部署），
+    // 再退回原版目录 origin/src/assets（本地 gitignore 的原版副本，内容一致）。
+    // 顺序即优先级：发布布局 exe 旁 assets 命中最早，dev 布局落到仓库根 assets。
+    let mut bases: Vec<std::path::PathBuf> = Vec::new();
+    let mut cur = Some(exe_dir.to_path_buf());
+    for _ in 0..4 {
+        let Some(p) = cur else { break };
+        bases.push(p.clone());
+        cur = p.parent().map(|x| x.to_path_buf());
     }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("origin").join("src").join("assets").join("tray-icons").join(&dir).join(&file));
+        bases.push(cwd);
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for base in &bases {
+        candidates.push(base.join("assets").join("tray-icons").join(&dir).join(&file));
+        candidates.push(
+            base.join("origin")
+                .join("src")
+                .join("assets")
+                .join("tray-icons")
+                .join(&dir)
+                .join(&file),
+        );
     }
     let icon_path = match candidates.iter().find(|p| p.exists()) {
         Some(p) => p.to_string_lossy().to_string(),
         None => {
-            logger::log_as("MAIN", "error", "Tray icon asset not found.");
+            logger::log_as(
+                "MAIN",
+                "error",
+                &format!("Tray icon asset not found: {}/{}", dir, file),
+            );
             return (None, None);
         }
     };

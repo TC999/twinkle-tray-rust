@@ -865,3 +865,81 @@ cargo test --workspace：全部通过
   窗口标题栏 + 任务栏 + Alt-Tab 均显示应用图标。
 - 资源编译失败仅降级为「无图标 exe」（外观缺失），不影响任何功能路径（§5 出错降级不崩溃）。
 
+
+## Round 21 · 2026-11-26：图标链路修正（.res 直连 + 依赖声明 + 资产搜索链）
+
+### 背景
+
+审计当前编译的图标嵌入方式，发现三处实际缺陷。触发点是读 cnblogs《Rust 编译windows 应用添加ICON》
+（`embed-resource` crate 路线）并核对其 MSVC 实现源码后，在本仓库实测验证出的结论。
+
+### 改动
+
+| 项 | 文件 | 说明 |
+|---|---|---|
+| .res 直连 | `build.rs` | rc.exe 产出的 `.res` 直接经 `cargo:rustc-link-arg-bins` 交给 link.exe（embed-resource 的 MSVC 做法）。**删除 cvtres 调用、`find_msvc_bin` 函数与硬编码 MSVC 安装路径**（`D:/Software/Visual Studio\VC\Tools\MSVC\14.41.34120`） |
+| 依赖声明 | `build.rs` | 显式 `println!("cargo:rerun-if-changed=assets/logo.ico")` |
+| 资产搜索链 | `src/main.rs` `start_tray` | 搜索链改为「exe 目录及其上溯三级 + 当前工作目录」为基点，每级优先 `assets/tray-icons`，再退回 `origin/src/assets/tray-icons` |
+
+### 关键结论（修正 Round 20 踩坑 #1）
+
+- embed-resource 3.0.12 的 MSVC 路径（`src/windows_msvc.rs::compile_resource`）只做
+  `rc.exe /fo <prefix>.res` + `println!("cargo:rustc-link-arg-bins={}", out_file)`
+  ——**全程无 cvtres、无 lib.exe**：link.exe 原生接受 .res 作为链接输入。
+- Round 20 记录的「.res 复制为 .lib 链接无效 → cargo 报 `Unsupported archive identifier`」
+  **结论需修正**：失败原因是**扩展名被改成 .lib**（cargo 按归档解析该文件），
+  不是 .res 不能当链接输入。保持 .res 原名直接作为 link-arg 即可。
+- 连带收益：删除 cvtres 即删除 CVT1101（工程路径含非 ASCII 字符时 cvtres 为 ANSI 工具打不开目标文件）
+  与硬编码 MSVC 路径。
+- **不引入 embed-resource crate**：其 3.0.12 依赖树为 cc / memchr / rustc_version / toml /
+  vswhom / winreg，其中 `winreg` 正是 AGENTS.md §1.2 明确否决过的（改用 Win32_System_Registry 直调），
+  违反 §1.1「依赖树最窄」；且它**不生成 rerun-if-changed**（官方文档明说
+  "we do not output said annotation"），依赖声明仍须自己写。
+  → 采纳其**做法**，不采纳其**依赖**。
+
+### 修复的三个缺陷
+
+1. **换图标不触发重建**：slint-build 只打印自己的 rerun-if-changed（ui/*.slint + assets/logo.png），
+   cargo 一旦收到任何 rerun-if-changed 就只跟踪这批路径 → 改 `assets/logo.ico` 后 build script
+   不重跑，exe 里嵌的仍是旧图标。
+   验证：改前 `touch assets/logo.ico && cargo build` → 只报 `Finished`（无 `Compiling`）；
+   改后 → 报 `Compiling twinkle-tray-rust`（build script 重跑）。
+2. **干净 clone 必然托盘图标缺失**：原 5 条候选全指向 `origin/src/assets`，而 `origin/` 被
+   .gitignore（git 跟踪数 = 0）→ 干净 clone 必然「Tray icon asset not found」→ 托盘线程不启动
+   → 热键亦不注册（Round 15 的 1 号坑必然复现）。入库的规范副本 `assets/tray-icons` 反而不在链上。
+3. **cvtres 多余且脆弱**（见上）。
+
+### 真机对拍（2026-11-26）
+
+```
+# exe 资源（解析 PE 资源目录树）
+.rsrc rawsize=24064
+   RT_ICON        id=(1,) size=22613
+   RT_GROUP_ICON  id=(1,) size=20
+   RT_VERSION     id=(1,) size=728
+（与 cvtres 旧链路产物逐字节一致；VersionInfo：desc=Twinkle Tray / ver=0.1.0 / company=Xander Frangos）
+
+# 干净 clone 模拟（/tmp/tt-clean/{target/debug, assets}，无 origin/），运行 8 秒抓日志
+[MAIN] Tray icon: C:/.../Temp/tt-clean/assets/tray-icons/dark/icon.ico   ← 命中入库的 assets/ 副本
+[MAIN] Tray icon thread started.
+
+# 回归
+cargo build --workspace：零错误（仅剩既有 cfg(target_os="win32") 警告，见下）
+cargo test --workspace：全部通过，0 failed
+```
+
+### 等价性说明
+
+- exe 图标/VERSIONINFO 的**内容**未变（同 logo.ico、同名字段），只换了资源链接方式
+  （.res 直连 vs .res→cvtres→obj），产物 `.rsrc` 段逐字节一致。
+- 托盘图标搜索链**只增不减**：新增 `assets/tray-icons` 候选并置于 `origin/src/assets` 之前
+  （后者是同一批文件的 gitignore 本地副本，`diff -rq` 逐字节一致），原候选全部保留在链上。
+  命中路径变化不影响图标内容与显示行为。
+
+### 遗留（本次未做，待定）
+
+- `assets/logo.ico` 自 commit fb82cd4「图标换色」起只剩单档 256×256（原 9 档），
+  exe 多分辨率图标降级；完整 9 档仍在未被引用的 `assets/logo-square.ico`。
+- 无打包/分发步骤（无 electron-builder 等价物），`assets/` 随 exe 部署尚无机制。
+- `#[cfg(target_os = "win32")]`（`src/main.rs:130`、`src/window_drag.rs:15`）是无效 cfg 值，
+  恒不编译 → winit 模态泵补丁从未生效。
