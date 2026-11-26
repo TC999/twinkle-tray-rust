@@ -24,8 +24,22 @@ jobs:
     - name: Cache Cargo
       uses: Swatinem/rust-cache@v2
 
+    # 先下载依赖，再修改 Cargo Registry
+    - name: Fetch and patch dependencies
+      shell: pwsh
+      run: |
+          $cargoHome = $env:CARGO_HOME
+          if (-not $cargoHome) {
+            $cargoHome = Join-Path $env:USERPROFILE '.cargo'
+          }
+
+          cargo fetch --locked
+
+          & "$env:GITHUB_WORKSPACE\tools\slint-winit-patch\apply.ps1" `
+            -CargoHome $cargoHome
+
     - name: Build
-      run: cargo build --release
+      run: cargo build --release --locked
 
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v7.0.0
