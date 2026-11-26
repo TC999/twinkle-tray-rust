@@ -13,6 +13,7 @@ use std::process::Command;
 fn main() {
     slint_build::compile("ui/all.slint").unwrap();
     build_windows_resources();
+    copy_tray_icons_to_target();
 }
 
 /// exe 资源：图标（资源 id 1，也是窗口图标的运行时降级来源）+ VERSIONINFO。
@@ -71,6 +72,68 @@ fn build_windows_resources() {
         ),
         Err(e) => println!("cargo:warning=rc.exe spawn failed: {e}; resources skipped"),
     }
+}
+
+/// 把托盘图标资产复制到 target/<profile>/assets/tray-icons（equiv 原版
+/// electron-builder 打包应用内 assets 的布局）。运行时 start_tray 按 exe
+/// 目录搜索链加载图标（src/main.rs），复制后 target/release 下的 exe 自带
+/// 同级 assets：本地 dev 直接运行、CI 直接打包上传，都不再需要单独布资产。
+/// 复制失败只降级警告不阻塞构建（托盘搜索链仍可命中仓库 assets 兜底）。
+fn copy_tray_icons_to_target() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    // 显式声明资产目录依赖：同 logo.ico 的理由，改动托盘图标后要重新复制。
+    println!("cargo:rerun-if-changed=assets/tray-icons");
+    let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") else {
+        return;
+    };
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        return;
+    };
+    // OUT_DIR = target/<profile>/build/<pkg>-<hash>/out，上溯三级即 target/<profile>。
+    let out_path = PathBuf::from(out_dir);
+    let Some(profile_dir) = out_path.ancestors().nth(3) else {
+        return;
+    };
+    let src = PathBuf::from(manifest_dir).join("assets").join("tray-icons");
+    let dst = profile_dir.join("assets").join("tray-icons");
+    if !src.is_dir() {
+        println!("cargo:warning=assets/tray-icons missing; tray icon assets not copied to target");
+        return;
+    }
+    match copy_dir_recursive(&src, &dst) {
+        Ok(n) if n > 0 => println!("cargo:warning=tray icon assets copied: {}", dst.display()),
+        Ok(_) => {}
+        Err(e) => println!("cargo:warning=copy tray icon assets failed: {e}; skipped"),
+    }
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {
+    std::fs::create_dir_all(dst)?;
+    let mut count = 0usize;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            count += copy_dir_recursive(&from, &to)?;
+        } else {
+            // 仅在内容变化时覆盖，避免无谓的 mtime 抖动
+            let needs_copy = match std::fs::metadata(&to) {
+                Ok(old) => {
+                    let new = entry.metadata()?;
+                    old.len() != new.len() || old.modified().ok() != new.modified().ok()
+                }
+                Err(_) => true,
+            };
+            if needs_copy {
+                std::fs::copy(&from, &to)?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// 定位 Windows SDK rc.exe：优先 SDK 环境变量，其次枚举默认安装位置取最新版本。
