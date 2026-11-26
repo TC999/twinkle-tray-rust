@@ -79,6 +79,23 @@ fn build_windows_resources() {
 /// 目录搜索链加载图标（src/main.rs），复制后 target/release 下的 exe 自带
 /// 同级 assets：本地 dev 直接运行、CI 直接打包上传，都不再需要单独布资产。
 /// 复制失败只降级警告不阻塞构建（托盘搜索链仍可命中仓库 assets 兜底）。
+///
+/// 注意：CI 不依赖本函数的产物。`target/<profile>/assets` 这种"构建期副作用"
+/// 在干净 runner 上虽可用，但 rust-cache 恢复缓存、目录被外部清理等场景下
+/// 不可靠，故 .github/workflows/ci.yml 另有独立的 Stage assets 步骤，
+/// 直接以仓库 assets/ 为唯一事实来源布点。本函数只服务于本地 dev 体验
+/// （target/debug、target/release 下的 exe 自带同级 assets，可直接运行）。
+///
+/// **目标目录不在 cargo 的跟踪范围内**（cargo 只认 build/<pkg>-<hash>/out），
+/// 这是本函数的固有风险：该目录被外部删除后（`cargo clean` 的部分清理、
+/// rust-cache 恢复缓存时丢弃「非依赖产物」、手工删除），cargo 仍可能判
+/// build script 为 Fresh 而直接跳过本函数。此时不仅不复制，日志里还会
+/// **重放**上一次写进 output 文件的 `cargo:warning=copied ...`，表现为
+/// 「日志说复制成功、目录却不存在」。因此这里显式把 dst 本身声明为
+/// rerun-if-changed 输入：目标缺失/被改动即成为 Dirty 理由，下次构建自愈。
+/// 注意不能用「指向永不存在的哨兵文件」那种写法强制每次执行——实测会让
+/// cargo 每次重编译整个 crate（本 crate 约 30s），代价不可接受。
+/// Steady state 下本函数不触碰 dst（见 assets_up_to_date 短路），保持 Fresh。
 fn copy_tray_icons_to_target() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -98,8 +115,15 @@ fn copy_tray_icons_to_target() {
     };
     let src = PathBuf::from(manifest_dir).join("assets").join("tray-icons");
     let dst = profile_dir.join("assets").join("tray-icons");
+    // 把目标目录也登记为输入（理由见函数头注释）：缺失即触发本函数重跑。
+    println!("cargo:rerun-if-changed={}", dst.display());
     if !src.is_dir() {
         println!("cargo:warning=assets/tray-icons missing; tray icon assets not copied to target");
+        return;
+    }
+    // 已一致就直接返回，不触碰 dst：写入会改变 mtime，而 dst 是 rerun 输入，
+    // mtime 抖动会让 cargo 每轮都判 Dirty、陷入反复重编译。
+    if matches!(assets_up_to_date(&src, &dst), Ok(true)) {
         return;
     }
     match copy_dir_recursive(&src, &dst) {
@@ -107,6 +131,35 @@ fn copy_tray_icons_to_target() {
         Ok(_) => {}
         Err(e) => println!("cargo:warning=copy tray icon assets failed: {e}; skipped"),
     }
+}
+
+/// 判断 dst 是否已与 src 完全一致（递归）。仅用于避免无谓写入导致的
+/// mtime 抖动；判据与 copy_dir_recursive 的 needs_copy 保持一致
+/// （长度 + mtime），不引入更严格的逐字节比较——那会把 34 个文件的
+/// 读取开销加到每次构建上，且与本函数的「快照即最新」语义不符。
+fn assets_up_to_date(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<bool> {
+    if !dst.is_dir() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            if !assets_up_to_date(&from, &to)? {
+                return Ok(false);
+            }
+        } else {
+            let Ok(old) = std::fs::metadata(&to) else {
+                return Ok(false);
+            };
+            let new = entry.metadata()?;
+            if old.len() != new.len() || old.modified().ok() != new.modified().ok() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {

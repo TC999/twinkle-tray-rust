@@ -41,6 +41,21 @@ jobs:
     - name: Build
       run: cargo build --release --locked
 
+    # build.rs 会把 assets/tray-icons 复制到 target/release/assets，但**该目录
+    # 不在 cargo 的跟踪范围内**（cargo 只认 target/<profile>/build/<pkg>-<hash>/out）。
+    # rust-cache 恢复缓存时「非依赖产物」会被丢弃，而 build script 仍可能被判
+    # Fresh 而跳过复制——日志还会重放上次写进 output 文件的 "copied" 警告，
+    # 于是 artifact 静默缺失托盘图标（exe 找不到图标即不建托盘，程序等于不可用）。
+    # 因此这里以仓库 assets/ 为唯一事实来源再布点一次（幂等），不依赖构建副作用。
+    - name: Stage assets
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Path target/release/assets -Force | Out-Null
+        Copy-Item -Path assets/tray-icons -Destination target/release/assets -Recurse -Force
+        $n = (Get-ChildItem target/release/assets/tray-icons -Recurse -File | Measure-Object).Count
+        Write-Output "staged $n tray icon files"
+        if ($n -eq 0) { throw 'tray icon assets missing from repository assets/' }
+
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v7.0.0
       with:
@@ -48,3 +63,4 @@ jobs:
         path: |
           target/release/assets/*
           target/release/*.exe
+        if-no-files-found: error
