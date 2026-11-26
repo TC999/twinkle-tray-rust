@@ -17,9 +17,13 @@ $crate = Get-ChildItem (Join-Path $CargoHome 'registry\src') -Directory |
 if (-not $crate) { throw 'i-slint-backend-winit-1.19.0 not found under CARGO_HOME/registry/src' }
 $lib = Join-Path $crate.FullName 'lib.rs'
 $text = Get-Content -Raw -LiteralPath $lib
+
+# 统一换行符为 CRLF，匹配下面的锚点
+$text = $text -replace "`r?`n", "`r`n"
 if ($text.Contains('with_window_msg_hook')) { Write-Output 'already patched'; exit 0 }
 
-$method = (Get-Content -Raw (Join-Path $PSScriptRoot 'with_window_msg_hook.rs.txt')) + "`r`n"
+$method = Get-Content -Raw (Join-Path $PSScriptRoot 'with_window_msg_hook.rs.txt')
+$method = ($method -replace "`r?`n", "`r`n") + "`r`n"
 $builderAnchor = "    #[must_use]`r`n    pub fn with_event_loop_builder(mut self, event_loop_builder: EventLoopBuilder) -> Self {"
 if (-not $text.Contains($builderAnchor)) { throw 'builder anchor not found' }
 $text = $text.Replace($builderAnchor, $method + $builderAnchor)
