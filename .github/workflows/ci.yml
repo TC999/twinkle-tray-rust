@@ -46,5 +46,5 @@ jobs:
       with:
         name: twinkle-tray-rust-x64
         path: |
-          target/release/assets
+          target/release/assets/*
           target/release/*.exe
